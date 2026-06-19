@@ -1,0 +1,62 @@
+# GC-TGCUP: GraphCodeBERT-enhanced Two-Stage Comment Update (beats TG-CUP gaps)
+project_name: "GC-TGCUP"
+
+data:
+  raw_dir: "cup2_dataset"
+  processed_dir: "data/processed"
+  max_samples: 1000          # test run limit
+  train_ratio: 0.8
+  valid_ratio: 0.1
+  test_ratio: 0.1
+  max_code_len: 256
+  max_comment_len: 128
+  max_edit_len: 512
+  long_comment_threshold: 25   # tokens – triggers local-edit mode
+  min_comment_len: 3
+  seed: 42
+
+model:
+  hidden_dim: 256              # reduced for 1k-sample test run
+  num_heads: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  ggnn_steps: 6
+  dropout: 0.1
+  graphcodebert: "microsoft/graphcodebert-base"
+  freeze_graphcodebert: false
+  vocab_size: 32000
+  beam_size: 5
+  max_decode_len: 50
+
+training:
+  batch_size: 4
+  detection_epochs: 15
+  update_epochs: 20
+  learning_rate: 2.0e-4
+  graphcodebert_lr: 1.0e-5    # separate lower LR for pretrained GraphCodeBERT
+  weight_decay: 0.01
+  patience: 8                  # more patience to allow longer learning
+  device: "auto"
+  checkpoint_dir: "checkpoints"
+  pos_weight: 1.86             # neg/pos = 650/350, fixes detector collapse
+
+evaluation:
+  metrics:
+    - accuracy
+    - recall_at_5
+    - gleu
+    - meteor
+    - sari
+    - bleu
+  detection_metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1
+  tgcup_baseline:
+    accuracy: 30.29
+    recall_at_5: 38.36
+    gleu: 60.64
+    meteor: 56.58
+    sari: 57.23
+    bleu: 76.68
