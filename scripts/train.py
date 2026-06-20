@@ -52,6 +52,12 @@ def main():
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Device: {device}")
+  if device.type == "cpu":
+    import os
+    n_threads = os.cpu_count() or 4
+    torch.set_num_threads(n_threads)
+    torch.set_num_interop_threads(max(1, n_threads // 2))
+    print(f"CPU threads: {n_threads} intra / {max(1, n_threads // 2)} inter")
 
   vocab = Vocabulary.load(os.path.join(args.processed_dir, "vocab.json"))
   train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")), vocab,
@@ -59,10 +65,13 @@ def main():
   valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")), vocab,
                         long_threshold=cfg["data"]["long_comment_threshold"])
 
+  num_workers = min(4, (os.cpu_count() or 1) // 2)
   train_loader = DataLoader(train_ds, batch_size=cfg["training"]["batch_size"],
-                            shuffle=True, collate_fn=collate_fn, num_workers=0)
+                            shuffle=True, collate_fn=collate_fn, num_workers=num_workers,
+                            persistent_workers=num_workers > 0)
   valid_loader = DataLoader(valid_ds, batch_size=cfg["training"]["batch_size"],
-                            shuffle=False, collate_fn=collate_fn, num_workers=0)
+                            shuffle=False, collate_fn=collate_fn, num_workers=num_workers,
+                            persistent_workers=num_workers > 0)
 
   model = GCTGCUP(
     vocab_size=len(vocab),
@@ -90,6 +99,7 @@ def main():
     checkpoint_dir=cfg["training"]["checkpoint_dir"],
     patience=cfg["training"]["patience"],
     vocab=vocab,
+    max_valid_batches=cfg["training"].get("max_valid_batches", 10),
     pos_weight=pos_weight,
   )
 

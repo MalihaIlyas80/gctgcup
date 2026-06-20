@@ -31,8 +31,13 @@ class OutdatedCommentDetector(nn.Module):
       hidden_dim=hidden_dim,
       freeze=freeze_bert,
     )
-    # share BERT weights – comment uses same encoder, different input
+    # shared BERT backbone but separate projection for comment domain
     self.comment_encoder = self.code_encoder
+    self.comment_proj = nn.Sequential(
+      nn.Linear(hidden_dim, hidden_dim),
+      nn.LayerNorm(hidden_dim),
+      nn.GELU(),
+    )
     self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=8, dropout=dropout, batch_first=True)
     self.classifier = nn.Sequential(
       nn.Linear(hidden_dim * 3, hidden_dim),
@@ -49,7 +54,8 @@ class OutdatedCommentDetector(nn.Module):
   ) -> torch.Tensor:
     device = next(self.parameters()).device
     code_h, code_mask = self.code_encoder.encode_code_pair(old_codes, new_codes, device)
-    com_h, com_mask = self.comment_encoder.encode_comment(comments, device)
+    com_h_raw, com_mask = self.comment_encoder.encode_comment(comments, device)
+    com_h = self.comment_proj(com_h_raw)
 
     attn_out, _ = self.cross_attn(
       query=com_h,

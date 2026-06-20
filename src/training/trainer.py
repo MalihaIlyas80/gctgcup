@@ -8,6 +8,7 @@ import time
 from typing import Dict, Optional
 
 import torch
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -26,7 +27,7 @@ class Trainer:
     checkpoint_dir: str = "checkpoints",
     patience: int = 5,
     vocab=None,
-    max_valid_batches: int = 3,
+    max_valid_batches: int = 10,
     pos_weight: Optional[torch.Tensor] = None,
   ):
     self.model = model.to(device)
@@ -43,6 +44,7 @@ class Trainer:
     os.makedirs(checkpoint_dir, exist_ok=True)
     self.best_val_loss = float("inf")
     self.epochs_no_improve = 0
+    self.scheduler = None
 
   def train_epoch(self) -> float:
     self.model.train()
@@ -56,6 +58,8 @@ class Trainer:
       loss.backward()
       torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
       self.optimizer.step()
+      if self.scheduler is not None:
+        self.scheduler.step()
       total_loss += loss.item()
       n += 1
     return total_loss / max(n, 1)
@@ -67,6 +71,7 @@ class Trainer:
     n = 0
     det_preds, det_labels = [], []
     predictions, references, sources = [], [], []
+    beam_candidates_all = []
     is_nciu_list, is_long_list = [], []
 
     for bi, batch in enumerate(tqdm(self.valid_loader, desc="Valid", leave=False)):
@@ -83,10 +88,11 @@ class Trainer:
       det_preds.extend(preds)
       det_labels.extend(labels)
 
-      gen_ids = self.model.generate(
+      gen_ids, beam_cands = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"], comments=batch["src_descs"],
+        return_beam_candidates=True,
       )
       for ids, ref, src in zip(gen_ids, batch["dst_descs"], batch["src_descs"]):
         if self.vocab:
@@ -97,11 +103,18 @@ class Trainer:
         references.append(ref)
         sources.append(src)
 
+      for cands in beam_cands:
+        if self.vocab:
+          beam_candidates_all.append([" ".join(self.vocab.decode(c)) for c in cands])
+        else:
+          beam_candidates_all.append([" ".join(str(t) for t in c) for c in cands])
+
       is_nciu_list.extend(batch["is_nciu"].cpu().tolist())
       is_long_list.extend(batch["is_long"].cpu().tolist())
 
     metrics = compute_all_metrics(
       predictions, references, sources,
+      beam_candidates=beam_candidates_all,
       det_preds=det_preds, det_labels=det_labels,
       is_nciu=is_nciu_list, is_long=is_long_list,
     )
@@ -118,6 +131,13 @@ class Trainer:
     return out
 
   def fit(self, epochs: int) -> Dict:
+    self.scheduler = OneCycleLR(
+      self.optimizer,
+      max_lr=[pg["lr"] for pg in self.optimizer.param_groups],
+      steps_per_epoch=len(self.train_loader),
+      epochs=epochs,
+      pct_start=0.1,
+    )
     history = []
     for epoch in range(1, epochs + 1):
       t0 = time.time()

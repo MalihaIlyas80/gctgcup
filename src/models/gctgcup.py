@@ -10,6 +10,7 @@ Extends TG-CUP with:
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -135,7 +136,7 @@ class GCTGCUP(nn.Module):
       node_text_ids = []
       for n in g.nodes:
         text = n.value if n.is_value_node else n.node_type
-        node_text_ids.append(hash(text) % (self.vocab_size - 10) + 10)
+        node_text_ids.append(int(hashlib.md5(text.encode()).hexdigest(), 16) % (self.vocab_size - 10) + 10)
       node_ids_batch.append(torch.tensor(node_text_ids, dtype=torch.long, device=device))
     return self.ggnn.forward_batch(node_ids_batch, graphs)
 
@@ -222,7 +223,7 @@ class GCTGCUP(nn.Module):
     else:
       result["upd_loss"] = torch.tensor(0.0, device=det_logits.device)
 
-    result["loss"] = det_loss + result["upd_loss"]
+    result["loss"] = 0.3 * det_loss + 0.7 * result["upd_loss"]
     return result
 
   @torch.no_grad()
@@ -235,8 +236,9 @@ class GCTGCUP(nn.Module):
     graphs: List[ASTDiffGraph],
     max_len: int = 50,
     beam_size: int = 5,
-    det_threshold: float = 0.5,
+    det_threshold: float = 0.3,
     comments: Optional[List[str]] = None,
+    return_beam_candidates: bool = False,
   ) -> List[List[int]]:
     """Generate updated comments with detection gate + beam search."""
     device = src_ids.device
@@ -248,10 +250,13 @@ class GCTGCUP(nn.Module):
     needs_update = det_probs >= det_threshold
 
     results: List[List[int]] = []
+    beam_results: List[List[List[int]]] = []
     for i in range(B):
       if not needs_update[i]:
         orig = src_ids[i].tolist()
-        results.append([t for t in orig if t not in (0, 1, 2)])
+        tok = [t for t in orig if t not in (0, 1, 2)]
+        results.append(tok)
+        beam_results.append([tok])
         continue
 
       seq_enc, seq_mask = self._encode_sequence_modal(
@@ -288,8 +293,11 @@ class GCTGCUP(nn.Module):
         if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
 
-      best = completed[0][0] if completed else beams[0][0]
+      all_finished = completed + beams
+      all_finished = sorted(all_finished, key=lambda x: x[1], reverse=True)[:beam_size]
+      best = all_finished[0][0]
       tok_ids = best[0, 1:].tolist()
+      beam_candidates = [[t for t in b[0, 1:].tolist() if t not in (0, 2)] for b, _ in all_finished]
 
       # Local edit refinement for long comments
       is_long_comment = src_ids[i].ne(self.pad_id).sum().item() > self.long_threshold
@@ -308,5 +316,8 @@ class GCTGCUP(nn.Module):
         tok_ids[-1] = local_logits[0].argmax().item()
 
       results.append(tok_ids)
+      beam_results.append(beam_candidates)
 
+    if return_beam_candidates:
+      return results, beam_results
     return results
