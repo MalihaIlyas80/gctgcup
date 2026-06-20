@@ -53,7 +53,6 @@ def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Device: {device}")
   if device.type == "cpu":
-    import os
     n_threads = os.cpu_count() or 4
     torch.set_num_threads(n_threads)
     torch.set_num_interop_threads(max(1, n_threads // 2))
