@@ -68,8 +68,8 @@ def sari_score(predictions: List[str], sources: List[str], references: List[str]
   for pred, src, ref in zip(predictions, sources, references):
     ps, rs, ss = set(_tokenize(pred)), set(_tokenize(ref)), set(_tokenize(src))
     keep = f1(len(ps & rs & ss), len(ps & ss), len(rs & ss))
-    add = f1(len(ps & rs - ss), len(ps - ss), len(rs - ss))
-    del_ = f1(len(ss - ps & ss), len(ss - ps), len(ss - rs))
+    add = f1(len((ps & rs) - ss), len(ps - ss), len(rs - ss))
+    del_ = f1(len((ss - ps) & (ss - rs)), len(ss - ps), len(ss - rs))
     scores.append((keep + add + del_) / 3)
   return np.mean(scores) * 100 if scores else 0.0
 

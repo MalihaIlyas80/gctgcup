@@ -29,6 +29,7 @@ class Trainer:
     vocab=None,
     max_valid_batches: int = 10,
     pos_weight: Optional[torch.Tensor] = None,
+    grad_accumulation_steps: int = 4,
   ):
     self.model = model.to(device)
     self.train_loader = train_loader
@@ -41,6 +42,7 @@ class Trainer:
     self.max_valid_batches = max_valid_batches
     # move pos_weight to device
     self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
+    self.grad_accumulation_steps = grad_accumulation_steps
     os.makedirs(checkpoint_dir, exist_ok=True)
     self.best_val_loss = float("inf")
     self.epochs_no_improve = 0
@@ -50,18 +52,27 @@ class Trainer:
     self.model.train()
     total_loss = 0.0
     n = 0
-    for batch in tqdm(self.train_loader, desc="Train", leave=False):
+    self.optimizer.zero_grad()
+    for step, batch in enumerate(tqdm(self.train_loader, desc="Train", leave=False)):
       batch = self._to_device(batch)
-      self.optimizer.zero_grad()
       out = self.model(batch, pos_weight=self.pos_weight)
-      loss = out["loss"]
+      loss = out["loss"] / self.grad_accumulation_steps
       loss.backward()
+      total_loss += out["loss"].item()
+      n += 1
+      if (step + 1) % self.grad_accumulation_steps == 0:
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        if self.scheduler is not None:
+          self.scheduler.step()
+        self.optimizer.zero_grad()
+    # final leftover
+    if n % self.grad_accumulation_steps != 0:
       torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
       self.optimizer.step()
       if self.scheduler is not None:
         self.scheduler.step()
-      total_loss += loss.item()
-      n += 1
+      self.optimizer.zero_grad()
     return total_loss / max(n, 1)
 
   @torch.no_grad()
@@ -131,10 +142,17 @@ class Trainer:
     return out
 
   def fit(self, epochs: int) -> Dict:
+    # resume from best checkpoint if it exists
+    best_path = os.path.join(self.checkpoint_dir, "best.pt")
+    if os.path.exists(best_path):
+      print("Resuming from best.pt ...")
+      self.load_checkpoint("best.pt")
+
+    steps_per_epoch = max(len(self.train_loader) // self.grad_accumulation_steps, 1)
     self.scheduler = OneCycleLR(
       self.optimizer,
       max_lr=[pg["lr"] for pg in self.optimizer.param_groups],
-      steps_per_epoch=len(self.train_loader),
+      steps_per_epoch=steps_per_epoch,
       epochs=epochs,
       pct_start=0.1,
     )

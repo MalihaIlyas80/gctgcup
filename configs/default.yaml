@@ -21,7 +21,7 @@ model:
   num_encoder_layers: 2        # halved
   num_decoder_layers: 2        # halved
   ggnn_steps: 4                # reduced from 6
-  dropout: 0.1
+  dropout: 0.3
   graphcodebert: "microsoft/graphcodebert-base"
   freeze_graphcodebert: true   # freeze BERT: biggest single CPU speedup
   vocab_size: 32000
@@ -29,14 +29,15 @@ model:
   max_decode_len: 30           # shorter outputs decode faster
 
 training:
-  batch_size: 8                # larger batch = fewer optimizer steps per epoch
+  batch_size: 8
   detection_epochs: 15
-  update_epochs: 15            # fewer epochs; early stopping covers the rest
-  max_valid_batches: 20        # validate on 20 batches instead of 50
-  learning_rate: 3.0e-4        # slightly higher LR to compensate fewer epochs
-  graphcodebert_lr: 0.0        # frozen BERT needs no LR
-  weight_decay: 0.01
-  patience: 5                  # stop earlier if not improving
+  update_epochs: 50
+  max_valid_batches: 100
+  learning_rate: 1.0e-4
+  graphcodebert_lr: 5.0e-6
+  weight_decay: 0.05
+  patience: 10
+  grad_accumulation_steps: 4   # effective batch = 8x4 = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
   pos_weight: 2.33             # neg/pos ratio ~70/30 from det_accuracy=70% baseline

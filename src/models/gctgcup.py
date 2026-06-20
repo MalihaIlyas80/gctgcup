@@ -217,6 +217,7 @@ class GCTGCUP(nn.Module):
         upd_logits.reshape(-1, self.vocab_size),
         targets.reshape(-1),
         ignore_index=self.pad_id,
+        label_smoothing=0.1,
       )
       result["upd_loss"] = upd_loss
       result["upd_logits"] = upd_logits
@@ -285,10 +286,17 @@ class GCTGCUP(nn.Module):
             memory_key_padding_mask=~mem_mask,
           )
           log_probs = F.log_softmax(self.output_proj(dec[:, -1]), dim=-1)
+          # repetition penalty: reduce score of already-seen tokens
+          seen = set(seq[0].tolist())
+          for tok_id in seen:
+            log_probs[0, tok_id] -= 1.2
           topk = torch.topk(log_probs, beam_size, dim=-1)
+          seq_len = seq.size(1)
           for k in range(beam_size):
             tok = topk.indices[0, k].unsqueeze(0).unsqueeze(0)
-            new_beams.append((torch.cat([seq, tok], dim=1), score + topk.values[0, k].item()))
+            # length-normalized score
+            new_score = (score * seq_len + topk.values[0, k].item()) / (seq_len + 1)
+            new_beams.append((torch.cat([seq, tok], dim=1), new_score))
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
         if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
