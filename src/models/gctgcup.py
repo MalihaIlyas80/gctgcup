@@ -256,46 +256,70 @@ class GCTGCUP(nn.Module):
     beam_size: int = 5,
     det_threshold: float = 0.45,
     comments: Optional[List[str]] = None,
+    src_descs: Optional[List[str]] = None,
     return_beam_candidates: bool = False,
-  ) -> List[List[int]]:
-    """Generate updated comments with detection gate + beam search."""
+  ) -> tuple:
+    """Generate updated comments with detection gate + beam search.
+
+    For samples where detector predicts no update needed, returns src_descs[i]
+    directly (no tokenization round-trip) so label=0 exact matches are preserved.
+
+    Returns:
+      token_ids: List[List[int]] — generated token ids (empty list for no-update)
+      no_update_texts: List[Optional[str]] — src_desc for no-update samples, None otherwise
+      beam_candidates (optional): List[List[List[int]]]
+    """
     device = src_ids.device
     B = src_ids.size(0)
     comments = comments or [""] * B
+    src_descs = src_descs or [""] * B
 
     det_logits = self.detect(old_codes, new_codes, comments)
     det_probs = torch.sigmoid(det_logits)
     needs_update = det_probs >= det_threshold
 
-    results: List[List[int]] = []
+    token_ids: List[List[int]] = []
+    no_update_texts: List[Optional[str]] = []
     beam_results: List[List[List[int]]] = []
+
     for i in range(B):
+      # ── No-update path: return original comment string directly ──
+      # This avoids tokenization round-trip errors that destroy exact match
       if not needs_update[i]:
-        orig = src_ids[i].tolist()
-        tok = [t for t in orig if t not in (0, 1, 2)]
-        results.append(tok)
-        beam_results.append([tok])
+        token_ids.append([])
+        no_update_texts.append(src_descs[i])
+        beam_results.append([[]])
         continue
 
-      seq_enc, seq_mask = self._encode_sequence_modal(
-        src_ids[i:i+1], edit_ids[i:i+1]
-      )
+      no_update_texts.append(None)
+
+      # ── Encode inputs ──
+      seq_enc, seq_mask = self._encode_sequence_modal(src_ids[i:i+1], edit_ids[i:i+1])
       graph_enc, graph_mask = self._encode_graph_batch([graphs[i]], device)
-      code_sem, code_mask = self.code_semantic.encode_code_pair(
-        [old_codes[i]], [new_codes[i]], device
-      )
+      code_sem, code_mask = self.code_semantic.encode_code_pair([old_codes[i]], [new_codes[i]], device)
       code_sem = self.fuse_code_sem(code_sem)
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask, seq_mask, graph_mask], dim=1)
 
-      beams = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
-      completed = []
+      # ── Pre-compute copy boost set (tokens from source comment) ──
+      src_token_set = set(src_ids[i].tolist()) - {0, 1, 2, 3, 4}
+      src_len = int(src_ids[i].ne(0).sum().item())
+      min_len = max(3, src_len // 2)
+
+      # ── Beam search ──
+      beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
+      completed: List[tuple] = []
+
       for _ in range(max_len):
-        new_beams = []
+        if not beams:
+          break
+        new_beams: List[tuple] = []
+
         for seq, score in beams:
           if seq[0, -1].item() == self.eos_id:
             completed.append((seq, score))
             continue
+
           tgt_emb = self._embed_seq(seq)
           tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq.size(1), device=device)
           dec = self.decoder(
@@ -303,57 +327,43 @@ class GCTGCUP(nn.Module):
             memory_key_padding_mask=~mem_mask,
           )
           log_probs = F.log_softmax(self.output_proj(dec[:, -1]), dim=-1)
-          # source copy boost: encourage reusing tokens from original comment
-          src_tokens = set(src_ids[i].tolist()) - {0, 1, 2, 3, 4}
-          for tok_id in src_tokens:
+
+          # Copy boost: strongly encourage reusing tokens from original comment
+          for tok_id in src_token_set:
             if tok_id < log_probs.size(-1):
-              log_probs[0, tok_id] += 0.8
-          # repetition penalty: reduce score of already-seen tokens
-          seen = set(seq[0].tolist())
+              log_probs[0, tok_id] += 1.0
+
+          # Repetition penalty: only for tokens NOT in source (copy tokens can repeat)
+          seen = set(seq[0].tolist()) - src_token_set
           for tok_id in seen:
-            if tok_id not in src_tokens:
-              log_probs[0, tok_id] -= 1.2
-          # min length: penalize EOS if sequence too short
-          src_len = src_ids[i].ne(0).sum().item()
-          min_len = max(3, src_len // 2)
-          if seq.size(1) < min_len:
+            if tok_id < log_probs.size(-1):
+              log_probs[0, tok_id] -= 1.5
+
+          # Min-length: block EOS until minimum length reached
+          if seq.size(1) <= min_len:
             log_probs[0, self.eos_id] -= 1e9
-          topk = torch.topk(log_probs, beam_size, dim=-1)
+
           seq_len = seq.size(1)
+          topk = torch.topk(log_probs, beam_size, dim=-1)
           for k in range(beam_size):
             tok = topk.indices[0, k].unsqueeze(0).unsqueeze(0)
-            # length-normalized score
+            # Length-normalized score prevents bias toward short sequences
             new_score = (score * seq_len + topk.values[0, k].item()) / (seq_len + 1)
             new_beams.append((torch.cat([seq, tok], dim=1), new_score))
+
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
         if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
 
-      all_finished = completed + beams
-      all_finished = sorted(all_finished, key=lambda x: x[1], reverse=True)[:beam_size]
-      best = all_finished[0][0]
-      tok_ids = best[0, 1:].tolist()
-      beam_candidates = [[t for t in b[0, 1:].tolist() if t not in (0, 2)] for b, _ in all_finished]
+      # ── Select best beam ──
+      all_finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
+      best_seq = all_finished[0][0]
+      best_tok_ids = [t for t in best_seq[0, 1:].tolist() if t not in (self.eos_id,)]
+      beam_cands = [[t for t in b[0, 1:].tolist() if t not in (self.eos_id,)] for b, _ in all_finished]
 
-      # Local edit refinement for long comments
-      is_long_comment = src_ids[i].ne(self.pad_id).sum().item() > self.long_threshold
-      if is_long_comment and tok_ids:
-        dec_last = self.decoder(
-          tgt=self._embed_seq(best[:, :-1] if best.size(1) > 1 else best),
-          memory=memory,
-          memory_key_padding_mask=~mem_mask,
-        )
-        local_logits = self.local_editor(
-          dec_last[:, -1],
-          seq_enc,
-          seq_mask,
-          src_ids[i:i+1],
-        )
-        tok_ids[-1] = local_logits[0].argmax().item()
-
-      results.append(tok_ids)
-      beam_results.append(beam_candidates)
+      token_ids.append(best_tok_ids)
+      beam_results.append(beam_cands)
 
     if return_beam_candidates:
-      return results, beam_results
-    return results
+      return token_ids, no_update_texts, beam_results
+    return token_ids, no_update_texts

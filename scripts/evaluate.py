@@ -38,24 +38,32 @@ def evaluate_model(model, loader, vocab, device):
         batch[k] = v.to(device)
 
     det_logits = model.detect(batch["src_methods"], batch["dst_methods"], batch["src_descs"])
-    preds = (torch.sigmoid(det_logits) >= 0.5).long().cpu().tolist()
+    preds = (torch.sigmoid(det_logits) >= 0.45).long().cpu().tolist()
     det_preds.extend(preds)
     det_labels.extend(batch["labels"].long().cpu().tolist())
 
-    gen_ids, beam_ids = model.generate(
+    gen_ids, no_upd_texts, beam_ids = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
       batch["graphs"],
       max_len=50, beam_size=5,
       comments=batch["src_descs"],
+      src_descs=batch["src_descs"],
       return_beam_candidates=True,
     )
-    for ids, cands, ref, src in zip(gen_ids, beam_ids, batch["dst_descs"], batch["src_descs"]):
-      pred_text = " ".join(vocab.decode(ids))
+    for ids, no_upd, cands, ref, src in zip(
+      gen_ids, no_upd_texts, beam_ids, batch["dst_descs"], batch["src_descs"]
+    ):
+      if no_upd is not None:
+        # No update predicted: use original comment directly (exact match preserved)
+        pred_text = no_upd
+        beam_cands.append([no_upd] * 5)
+      else:
+        pred_text = " ".join(vocab.decode(ids))
+        beam_cands.append([" ".join(vocab.decode(c)) for c in cands])
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
-      beam_cands.append([" ".join(vocab.decode(c)) for c in cands])
 
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())

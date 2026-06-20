@@ -94,31 +94,37 @@ class Trainer:
       n += 1
 
       det_logits = out["det_logits"]
-      preds = (torch.sigmoid(det_logits) >= 0.5).long().cpu().tolist()
+      preds = (torch.sigmoid(det_logits) >= 0.45).long().cpu().tolist()
       labels = batch["labels"].long().cpu().tolist()
       det_preds.extend(preds)
       det_labels.extend(labels)
 
-      gen_ids, beam_cands = self.model.generate(
+      gen_ids, no_upd_texts, beam_cands = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
-        batch["graphs"], comments=batch["src_descs"],
+        batch["graphs"],
+        comments=batch["src_descs"],
+        src_descs=batch["src_descs"],
         return_beam_candidates=True,
       )
-      for ids, ref, src in zip(gen_ids, batch["dst_descs"], batch["src_descs"]):
-        if self.vocab:
-          pred_text = " ".join(self.vocab.decode(ids))
+
+      for ids, no_upd, cands, ref, src in zip(
+        gen_ids, no_upd_texts, beam_cands, batch["dst_descs"], batch["src_descs"]
+      ):
+        if no_upd is not None:
+          # No update predicted: return original comment directly (no tokenization loss)
+          pred_text = no_upd
+          beam_texts = [no_upd] * 5
         else:
-          pred_text = " ".join(str(t) for t in ids)
+          pred_text = " ".join(self.vocab.decode(ids)) if self.vocab else " ".join(str(t) for t in ids)
+          beam_texts = [
+            " ".join(self.vocab.decode(c)) if self.vocab else " ".join(str(t) for t in c)
+            for c in cands
+          ]
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)
-
-      for cands in beam_cands:
-        if self.vocab:
-          beam_candidates_all.append([" ".join(self.vocab.decode(c)) for c in cands])
-        else:
-          beam_candidates_all.append([" ".join(str(t) for t in c) for c in cands])
+        beam_candidates_all.append(beam_texts)
 
       is_nciu_list.extend(batch["is_nciu"].cpu().tolist())
       is_long_list.extend(batch["is_long"].cpu().tolist())
