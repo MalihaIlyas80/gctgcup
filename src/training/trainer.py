@@ -160,7 +160,7 @@ class Trainer:
       max_lr=[pg["lr"] for pg in self.optimizer.param_groups],
       steps_per_epoch=steps_per_epoch,
       epochs=epochs,
-      pct_start=0.1,
+      pct_start=0.2,
     )
     history = []
     for epoch in range(1, epochs + 1):

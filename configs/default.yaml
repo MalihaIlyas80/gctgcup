@@ -31,12 +31,12 @@ model:
 training:
   batch_size: 8
   detection_epochs: 15
-  update_epochs: 50
+  update_epochs: 15
   max_valid_batches: 100
-  learning_rate: 1.0e-4
-  graphcodebert_lr: 5.0e-6
+  learning_rate: 2.0e-4
+  graphcodebert_lr: 1.0e-5
   weight_decay: 0.05
-  patience: 10
+  patience: 5
   grad_accumulation_steps: 4   # effective batch = 8x4 = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
