@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare cleaned 1000-sample dataset for GC-TGCUP."""
+"""Prepare cleaned dataset for GC-TGCUP."""
 import argparse
 import json
 import os
@@ -14,7 +14,7 @@ def main():
   parser = argparse.ArgumentParser(description="Clean and split CUP2 dataset")
   parser.add_argument("--raw-dir", default="cup2_dataset")
   parser.add_argument("--output-dir", default="data/processed")
-  parser.add_argument("--max-samples", type=int, default=1000)
+  parser.add_argument("--max-samples", type=int, default=5000)
   parser.add_argument("--seed", type=int, default=42)
   args = parser.parse_args()
 
