@@ -42,19 +42,20 @@ def evaluate_model(model, loader, vocab, device):
     det_preds.extend(preds)
     det_labels.extend(batch["labels"].long().cpu().tolist())
 
-    gen_ids = model.generate(
+    gen_ids, beam_ids = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
       batch["graphs"],
       max_len=50, beam_size=5,
       comments=batch["src_descs"],
+      return_beam_candidates=True,
     )
-    for ids, ref, src in zip(gen_ids, batch["dst_descs"], batch["src_descs"]):
+    for ids, cands, ref, src in zip(gen_ids, beam_ids, batch["dst_descs"], batch["src_descs"]):
       pred_text = " ".join(vocab.decode(ids))
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
-      beam_cands.append([pred_text])
+      beam_cands.append([" ".join(vocab.decode(c)) for c in cands])
 
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())

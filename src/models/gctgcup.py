@@ -219,6 +219,23 @@ class GCTGCUP(nn.Module):
         ignore_index=self.pad_id,
         label_smoothing=0.1,
       )
+      # copy reward: extra loss weight on target tokens that also appear in source
+      src_batch = batch["src_ids"][idx]
+      copy_weight = torch.zeros_like(targets, dtype=torch.float)
+      for b in range(targets.size(0)):
+        src_set = set(src_batch[b].tolist()) - {0, 1, 2, 3, 4}
+        for t in range(targets.size(1)):
+          if targets[b, t].item() in src_set:
+            copy_weight[b, t] = 1.0
+      if copy_weight.sum() > 0:
+        copy_loss = F.cross_entropy(
+          upd_logits.reshape(-1, self.vocab_size),
+          targets.reshape(-1),
+          ignore_index=self.pad_id,
+          reduction='none',
+        )
+        copy_loss = (copy_loss * copy_weight.reshape(-1)).sum() / copy_weight.sum().clamp(min=1)
+        upd_loss = upd_loss + 0.3 * copy_loss
       result["upd_loss"] = upd_loss
       result["upd_logits"] = upd_logits
     else:
@@ -237,7 +254,7 @@ class GCTGCUP(nn.Module):
     graphs: List[ASTDiffGraph],
     max_len: int = 50,
     beam_size: int = 5,
-    det_threshold: float = 0.3,
+    det_threshold: float = 0.45,
     comments: Optional[List[str]] = None,
     return_beam_candidates: bool = False,
   ) -> List[List[int]]:
@@ -286,10 +303,21 @@ class GCTGCUP(nn.Module):
             memory_key_padding_mask=~mem_mask,
           )
           log_probs = F.log_softmax(self.output_proj(dec[:, -1]), dim=-1)
+          # source copy boost: encourage reusing tokens from original comment
+          src_tokens = set(src_ids[i].tolist()) - {0, 1, 2, 3, 4}
+          for tok_id in src_tokens:
+            if tok_id < log_probs.size(-1):
+              log_probs[0, tok_id] += 0.8
           # repetition penalty: reduce score of already-seen tokens
           seen = set(seq[0].tolist())
           for tok_id in seen:
-            log_probs[0, tok_id] -= 1.2
+            if tok_id not in src_tokens:
+              log_probs[0, tok_id] -= 1.2
+          # min length: penalize EOS if sequence too short
+          src_len = src_ids[i].ne(0).sum().item()
+          min_len = max(3, src_len // 2)
+          if seq.size(1) < min_len:
+            log_probs[0, self.eos_id] -= 1e9
           topk = torch.topk(log_probs, beam_size, dim=-1)
           seq_len = seq.size(1)
           for k in range(beam_size):

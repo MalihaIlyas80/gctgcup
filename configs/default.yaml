@@ -4,13 +4,13 @@ project_name: "GC-TGCUP"
 data:
   raw_dir: "cup2_dataset"
   processed_dir: "data/processed"
-  max_samples: 1000          # test run limit
+  max_samples: 10000
   train_ratio: 0.8
   valid_ratio: 0.1
   test_ratio: 0.1
-  max_code_len: 128
-  max_comment_len: 64
-  max_edit_len: 256
+  max_code_len: 256
+  max_comment_len: 128
+  max_edit_len: 512
   long_comment_threshold: 25   # tokens – triggers local-edit mode
   min_comment_len: 3
   seed: 42
@@ -25,8 +25,8 @@ model:
   graphcodebert: "microsoft/graphcodebert-base"
   freeze_graphcodebert: true   # freeze BERT: biggest single CPU speedup
   vocab_size: 32000
-  beam_size: 3                 # reduced from 5: beam search is O(beam_size) per step
-  max_decode_len: 30           # shorter outputs decode faster
+  beam_size: 5
+  max_decode_len: 50
 
 training:
   batch_size: 8
