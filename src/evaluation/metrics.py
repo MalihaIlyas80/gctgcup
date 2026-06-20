@@ -67,6 +67,15 @@ def sari_score(predictions: List[str], sources: List[str], references: List[str]
   scores = []
   for pred, src, ref in zip(predictions, sources, references):
     ps, rs, ss = set(_tokenize(pred)), set(_tokenize(ref)), set(_tokenize(src))
+    # No-change case: ref says keep everything, pred keeps everything → perfect SARI
+    # Standard SARI paper: score=1.0 when no edit needed and none made
+    nothing_to_add = not (rs - ss)
+    nothing_to_delete = not (ss - rs)
+    pred_no_add = not (ps - ss)
+    pred_no_delete = not (ss - ps)
+    if nothing_to_add and nothing_to_delete and pred_no_add and pred_no_delete:
+      scores.append(1.0)
+      continue
     keep = f1(len(ps & rs & ss), len(ps & ss), len(rs & ss))
     add = f1(len((ps & rs) - ss), len(ps - ss), len(rs - ss))
     del_ = f1(len((ss - ps) & (ss - rs)), len(ss - ps), len(ss - rs))

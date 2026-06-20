@@ -219,23 +219,29 @@ class GCTGCUP(nn.Module):
         ignore_index=self.pad_id,
         label_smoothing=0.1,
       )
-      # copy reward: extra loss weight on target tokens that also appear in source
+      # Edit-aware loss: reward both copy (kept tokens) and novel tokens (added)
+      # This teaches the model to selectively keep AND delete, improving SARI
       src_batch = batch["src_ids"][idx]
-      copy_weight = torch.zeros_like(targets, dtype=torch.float)
+      token_loss = F.cross_entropy(
+        upd_logits.reshape(-1, self.vocab_size),
+        targets.reshape(-1),
+        ignore_index=self.pad_id,
+        reduction='none',
+      ).view(targets.size())
+      edit_weight = torch.ones_like(targets, dtype=torch.float)
       for b in range(targets.size(0)):
         src_set = set(src_batch[b].tolist()) - {0, 1, 2, 3, 4}
+        dst_set = set(targets[b].tolist()) - {0, 1, 2, 3, 4}
         for t in range(targets.size(1)):
-          if targets[b, t].item() in src_set:
-            copy_weight[b, t] = 1.0
-      if copy_weight.sum() > 0:
-        copy_loss = F.cross_entropy(
-          upd_logits.reshape(-1, self.vocab_size),
-          targets.reshape(-1),
-          ignore_index=self.pad_id,
-          reduction='none',
-        )
-        copy_loss = (copy_loss * copy_weight.reshape(-1)).sum() / copy_weight.sum().clamp(min=1)
-        upd_loss = upd_loss + 0.3 * copy_loss
+          tok = targets[b, t].item()
+          if tok == self.pad_id:
+            edit_weight[b, t] = 0.0
+          elif tok in src_set and tok in dst_set:
+            edit_weight[b, t] = 1.0   # kept token
+          elif tok not in src_set and tok in dst_set:
+            edit_weight[b, t] = 2.0   # added token (harder, more reward)
+      weighted_loss = (token_loss * edit_weight).sum() / edit_weight.sum().clamp(min=1)
+      upd_loss = 0.6 * upd_loss + 0.4 * weighted_loss
       result["upd_loss"] = upd_loss
       result["upd_logits"] = upd_logits
     else:
@@ -301,7 +307,7 @@ class GCTGCUP(nn.Module):
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask, seq_mask, graph_mask], dim=1)
 
-      # ── Pre-compute copy boost set (tokens from source comment) ──
+      # ── Pre-compute source token info ──
       src_token_set = set(src_ids[i].tolist()) - {0, 1, 2, 3, 4}
       src_len = int(src_ids[i].ne(0).sum().item())
       min_len = max(3, src_len // 2)
@@ -328,18 +334,18 @@ class GCTGCUP(nn.Module):
           )
           log_probs = F.log_softmax(self.output_proj(dec[:, -1]), dim=-1)
 
-          # Copy boost: strongly encourage reusing tokens from original comment
+          # Soft copy boost (reduced from 1.0 to 0.4 to allow deletions for SARI)
           for tok_id in src_token_set:
             if tok_id < log_probs.size(-1):
-              log_probs[0, tok_id] += 1.0
+              log_probs[0, tok_id] += 0.4
 
-          # Repetition penalty: only for tokens NOT in source (copy tokens can repeat)
+          # Repetition penalty for non-source tokens only
           seen = set(seq[0].tolist()) - src_token_set
           for tok_id in seen:
             if tok_id < log_probs.size(-1):
-              log_probs[0, tok_id] -= 1.5
+              log_probs[0, tok_id] -= 1.2
 
-          # Min-length: block EOS until minimum length reached
+          # Block EOS until minimum length reached
           if seq.size(1) <= min_len:
             log_probs[0, self.eos_id] -= 1e9
 
@@ -347,7 +353,6 @@ class GCTGCUP(nn.Module):
           topk = torch.topk(log_probs, beam_size, dim=-1)
           for k in range(beam_size):
             tok = topk.indices[0, k].unsqueeze(0).unsqueeze(0)
-            # Length-normalized score prevents bias toward short sequences
             new_score = (score * seq_len + topk.values[0, k].item()) / (seq_len + 1)
             new_beams.append((torch.cat([seq, tok], dim=1), new_score))
 
@@ -355,11 +360,34 @@ class GCTGCUP(nn.Module):
         if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
 
-      # ── Select best beam ──
+      # ── Edit-quality reranking for SARI/GLEU improvement ──
+      # Combines LM score with edit quality (rewards balanced keep+delete+add)
       all_finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
-      best_seq = all_finished[0][0]
-      best_tok_ids = [t for t in best_seq[0, 1:].tolist() if t not in (self.eos_id,)]
-      beam_cands = [[t for t in b[0, 1:].tolist() if t not in (self.eos_id,)] for b, _ in all_finished]
+
+      def edit_quality(cand_ids: List[int]) -> float:
+        cand_set = set(cand_ids) - {0, 1, 2, 3, 4}
+        if not src_token_set:
+          return 0.0
+        kept = len(cand_set & src_token_set)
+        deleted = len(src_token_set - cand_set)
+        added = len(cand_set - src_token_set)
+        keep_ratio = kept / len(src_token_set)
+        edit_ratio = (deleted + added) / max(len(src_token_set) + len(cand_set), 1)
+        # Reward: close to source length, makes some meaningful edits
+        keep_score = 1.0 - abs(keep_ratio - 0.8) * 2
+        return 0.4 * edit_ratio + 0.6 * max(keep_score, 0.0)
+
+      reranked = []
+      for seq, lm_score in all_finished:
+        cand = [t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)]
+        eq = edit_quality(cand)
+        # Weighted combination: LM score (primary) + edit quality (secondary)
+        combined = 0.75 * lm_score + 0.25 * eq
+        reranked.append((seq, lm_score, combined, cand))
+
+      reranked.sort(key=lambda x: x[2], reverse=True)
+      best_tok_ids = reranked[0][3]
+      beam_cands = [r[3] for r in reranked]
 
       token_ids.append(best_tok_ids)
       beam_results.append(beam_cands)

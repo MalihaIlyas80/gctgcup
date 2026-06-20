@@ -25,7 +25,7 @@ model:
   graphcodebert: "microsoft/graphcodebert-base"
   freeze_graphcodebert: true   # freeze BERT: biggest single CPU speedup
   vocab_size: 32000
-  beam_size: 5
+  beam_size: 8
   max_decode_len: 50
 
 training:
