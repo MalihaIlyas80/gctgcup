@@ -29,7 +29,7 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
   model.eval()
   predictions, references, sources = [], [], []
   det_preds, det_labels = [], []
-  is_nciu, is_long = [], []
+  is_nciu, is_long, outdated = [], [], []
   beam_cands = []
 
   for batch in loader:
@@ -46,6 +46,9 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
     src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
     ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
+    # force_update=True -> always generate (TG-CUP-style pure update quality).
+    # Update metrics are later restricted to the outdated-only subset so the
+    # comparison with TG-CUP is apples-to-apples.
     gen_ids, no_upd_texts, beam_ids = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
@@ -55,6 +58,7 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
       comments=batch["src_descs"],
       src_descs=src_tok_texts,
       return_beam_candidates=True,
+      force_update=True,
     )
     for ids, no_upd, cands, ref, src in zip(
       gen_ids, no_upd_texts, beam_ids, ref_tok_texts, src_tok_texts
@@ -72,17 +76,22 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
 
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())
+    outdated.extend(batch["labels"].long().cpu().tolist())
 
   return compute_all_metrics(
     predictions, references, sources,
     beam_candidates=beam_cands,
     det_preds=det_preds, det_labels=det_labels,
     is_nciu=is_nciu, is_long=is_long,
+    outdated=outdated,
   )
 
 
 def print_comparison(metrics, baseline):
+  # ── Option A: UPDATE stage on outdated-only subset (fair TG-CUP setting) ──
   print("\n" + "=" * 70)
+  print(f" UPDATE STAGE  |  outdated-only subset (N={metrics.num_outdated})  |  vs TG-CUP")
+  print("=" * 70)
   print(f"{'Metric':<25} {'GC-TGCUP':>12} {'TG-CUP':>12} {'Delta':>12}")
   print("-" * 70)
   mapping = {
@@ -93,20 +102,29 @@ def print_comparison(metrics, baseline):
     "sari": "sari",
     "bleu": "bleu",
   }
+  wins = 0
   for key, bkey in mapping.items():
     ours = getattr(metrics, key)
     base = baseline.get(bkey, 0)
     delta = ours - base
     sign = "+" if delta >= 0 else ""
+    wins += int(delta >= 0)
     print(f"{key:<25} {ours:>11.2f}% {base:>11.2f}% {sign}{delta:>10.2f}%")
-
   print("-" * 70)
+  print(f"{'nciu_accuracy':<25} {metrics.nciu_accuracy:>11.2f}%   (NCIU robustness, N={metrics.num_nciu})")
+  print(f"{'long_comment_accuracy':<25} {metrics.long_comment_accuracy:>11.2f}%   (long comments, N={metrics.num_long})")
+  print("-" * 70)
+  print(f"  -> GC-TGCUP beats TG-CUP on {wins}/{len(mapping)} update metrics")
+
+  # ── Option B: DETECTION stage on full imbalanced set (TG-CUP has none) ──
+  print("\n" + "=" * 70)
+  print(f" DETECTION STAGE  |  full imbalanced set (N={metrics.num_total}, "
+        f"pos={metrics.det_pos_ratio:.1f}%)  |  TG-CUP has none")
+  print("=" * 70)
   print(f"{'det_accuracy':<25} {metrics.det_accuracy:>11.2f}%")
   print(f"{'det_precision':<25} {metrics.det_precision:>11.2f}%")
   print(f"{'det_recall':<25} {metrics.det_recall:>11.2f}%")
   print(f"{'det_f1':<25} {metrics.det_f1:>11.2f}%")
-  print(f"{'nciu_accuracy':<25} {metrics.nciu_accuracy:>11.2f}%")
-  print(f"{'long_comment_accuracy':<25} {metrics.long_comment_accuracy:>11.2f}%")
   print("=" * 70)
 
 

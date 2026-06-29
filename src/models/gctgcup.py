@@ -295,11 +295,16 @@ class GCTGCUP(nn.Module):
     comments: Optional[List[str]] = None,
     src_descs: Optional[List[str]] = None,
     return_beam_candidates: bool = False,
+    force_update: bool = False,
   ) -> tuple:
     """Generate updated comments with detection gate + beam search.
 
     For samples where detector predicts no update needed, returns src_descs[i]
     directly (no tokenization round-trip) so label=0 exact matches are preserved.
+
+    force_update=True bypasses the detection gate and generates an updated
+    comment for EVERY sample. This is used for the fair, TG-CUP-style update
+    evaluation on the outdated-only subset (TG-CUP always updates, never gates).
 
     Returns:
       token_ids: List[List[int]] — generated token ids (empty list for no-update)
@@ -315,7 +320,10 @@ class GCTGCUP(nn.Module):
     code_h, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
     det_logits = self.detector(old_codes, new_codes, comments, code_cache=(code_h, code_mask))
     det_probs = torch.sigmoid(det_logits)
-    needs_update = det_probs >= det_threshold
+    if force_update:
+      needs_update = torch.ones_like(det_probs, dtype=torch.bool)
+    else:
+      needs_update = det_probs >= det_threshold
 
     token_ids: List[List[int]] = []
     no_update_texts: List[Optional[str]] = []

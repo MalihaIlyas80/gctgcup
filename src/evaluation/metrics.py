@@ -112,24 +112,37 @@ class EvaluationMetrics:
   det_precision: float = 0.0
   det_recall: float = 0.0
   det_f1: float = 0.0
+  det_pos_ratio: float = 0.0
   nciu_accuracy: float = 0.0
   long_comment_accuracy: float = 0.0
+  num_total: int = 0
+  num_outdated: int = 0
+  num_nciu: int = 0
+  num_long: int = 0
   per_sample: Dict = field(default_factory=dict)
 
   def to_dict(self) -> Dict:
     return {
+      # Update stage (outdated-only subset) — fair TG-CUP comparison
       "accuracy": round(self.accuracy, 2),
       "recall_at_5": round(self.recall_at_5, 2),
       "gleu": round(self.gleu, 2),
       "meteor": round(self.meteor, 2),
       "sari": round(self.sari, 2),
       "bleu": round(self.bleu, 2),
+      "nciu_accuracy": round(self.nciu_accuracy, 2),
+      "long_comment_accuracy": round(self.long_comment_accuracy, 2),
+      # Detection stage (full imbalanced set) — TG-CUP has no detection
       "det_accuracy": round(self.det_accuracy, 2),
       "det_precision": round(self.det_precision, 2),
       "det_recall": round(self.det_recall, 2),
       "det_f1": round(self.det_f1, 2),
-      "nciu_accuracy": round(self.nciu_accuracy, 2),
-      "long_comment_accuracy": round(self.long_comment_accuracy, 2),
+      "det_pos_ratio": round(self.det_pos_ratio, 2),
+      # Sample counts for context
+      "num_total": self.num_total,
+      "num_outdated": self.num_outdated,
+      "num_nciu": self.num_nciu,
+      "num_long": self.num_long,
     }
 
 
@@ -142,38 +155,65 @@ def compute_all_metrics(
   det_labels: Optional[List[int]] = None,
   is_nciu: Optional[List[bool]] = None,
   is_long: Optional[List[bool]] = None,
+  outdated: Optional[List[int]] = None,
 ) -> EvaluationMetrics:
+  """
+  Two-stage evaluation:
+    * UPDATE stage  -> generation metrics on the OUTDATED-only subset
+                       (label==1). This mirrors TG-CUP, which only ever
+                       evaluates on outdated samples and always updates.
+    * DETECTION stage -> precision/recall/F1 on the FULL (imbalanced) set,
+                       since deciding whether to update is our own contribution
+                       that TG-CUP does not have.
+  """
   m = EvaluationMetrics()
+  m.num_total = len(references)
 
-  m.accuracy = sum(exact_match(p, r) for p, r in zip(predictions, references)) / max(len(references), 1) * 100
+  # ── Indices that count for the UPDATE task (outdated-only when provided) ──
+  if outdated is not None:
+    upd_idx = [i for i, o in enumerate(outdated) if o]
+  else:
+    upd_idx = list(range(len(references)))
+  m.num_outdated = len(upd_idx)
+
+  upd_preds = [predictions[i] for i in upd_idx]
+  upd_refs = [references[i] for i in upd_idx]
+  upd_srcs = [sources[i] for i in upd_idx]
+
+  m.accuracy = sum(exact_match(p, r) for p, r in zip(upd_preds, upd_refs)) / max(len(upd_refs), 1) * 100
 
   if beam_candidates:
-    m.recall_at_5 = recall_at_k(beam_candidates, references, k=5)
+    upd_cands = [beam_candidates[i] for i in upd_idx]
+    m.recall_at_5 = recall_at_k(upd_cands, upd_refs, k=5)
   else:
     m.recall_at_5 = m.accuracy
 
-  m.gleu = gleu_score(predictions, references)
-  m.meteor = meteor_score(predictions, references)
-  m.sari = sari_score(predictions, sources, references)
-  m.bleu = bleu_score(predictions, references)
+  m.gleu = gleu_score(upd_preds, upd_refs)
+  m.meteor = meteor_score(upd_preds, upd_refs)
+  m.sari = sari_score(upd_preds, upd_srcs, upd_refs)
+  m.bleu = bleu_score(upd_preds, upd_refs)
 
+  # ── Detection on the FULL imbalanced set ──
   if det_preds is not None and det_labels is not None:
     m.det_accuracy = accuracy_score(det_labels, det_preds) * 100
     p, r, f1, _ = precision_recall_fscore_support(det_labels, det_preds, average="binary", zero_division=0)
     m.det_precision = p * 100
     m.det_recall = r * 100
     m.det_f1 = f1 * 100
+    m.det_pos_ratio = sum(det_labels) / max(len(det_labels), 1) * 100
 
+  # ── NCIU robustness (within the outdated update subset) ──
   if is_nciu:
-    nciu_preds = [predictions[i] for i, f in enumerate(is_nciu) if f]
-    nciu_refs = [references[i] for i, f in enumerate(is_nciu) if f]
-    if nciu_preds:
-      m.nciu_accuracy = sum(exact_match(p, r) for p, r in zip(nciu_preds, nciu_refs)) / len(nciu_preds) * 100
+    nciu_idx = [i for i in upd_idx if is_nciu[i]]
+    m.num_nciu = len(nciu_idx)
+    if nciu_idx:
+      m.nciu_accuracy = sum(exact_match(predictions[i], references[i]) for i in nciu_idx) / len(nciu_idx) * 100
 
+  # ── Long/complex comments (within the outdated update subset) ──
   if is_long:
-    long_preds = [predictions[i] for i, f in enumerate(is_long) if f]
-    long_refs = [references[i] for i, f in enumerate(is_long) if f]
-    if long_preds:
-      m.long_comment_accuracy = sum(exact_match(p, r) for p, r in zip(long_preds, long_refs)) / len(long_preds) * 100
+    long_idx = [i for i in upd_idx if is_long[i]]
+    m.num_long = len(long_idx)
+    if long_idx:
+      m.long_comment_accuracy = sum(exact_match(predictions[i], references[i]) for i in long_idx) / len(long_idx) * 100
 
   return m
