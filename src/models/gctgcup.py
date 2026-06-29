@@ -153,24 +153,28 @@ class GCTGCUP(nn.Module):
     seq_ids:  (B, S) vocab ids of the source tokens (for copy scatter)
     Returns log P(token) of shape (B, T, V).
     """
-    B, T, _ = decoded.shape
-    V = self.vocab_size
+    # Force fp32 here: under AMP, probabilities + log(clamp(1e-9)) would
+    # underflow in fp16 and produce NaNs.
+    with torch.autocast(device_type=decoded.device.type, enabled=False):
+      decoded = decoded.float()
+      seq_enc = seq_enc.float()
+      B, T, _ = decoded.shape
 
-    gen_prob = F.softmax(self.output_proj(decoded), dim=-1)          # (B, T, V)
+      gen_prob = F.softmax(self.output_proj(decoded), dim=-1)          # (B, T, V)
 
-    keys = self.copy_key(seq_enc)                                    # (B, S, D)
-    scores = torch.bmm(decoded, keys.transpose(1, 2))                # (B, T, S)
-    scores = scores / (self.hidden_dim ** 0.5)
-    scores = scores.masked_fill(~seq_mask.unsqueeze(1), float("-inf"))
-    copy_attn = F.softmax(scores, dim=-1)                            # (B, T, S)
-    context = torch.bmm(copy_attn, seq_enc)                          # (B, T, D)
+      keys = self.copy_key(seq_enc)                                    # (B, S, D)
+      scores = torch.bmm(decoded, keys.transpose(1, 2))                # (B, T, S)
+      scores = scores / (self.hidden_dim ** 0.5)
+      scores = scores.masked_fill(~seq_mask.unsqueeze(1), float("-inf"))
+      copy_attn = F.softmax(scores, dim=-1)                            # (B, T, S)
+      context = torch.bmm(copy_attn, seq_enc)                          # (B, T, D)
 
-    p_gen = torch.sigmoid(self.p_gen(torch.cat([decoded, context], dim=-1)))  # (B, T, 1)
+      p_gen = torch.sigmoid(self.p_gen(torch.cat([decoded, context], dim=-1)))  # (B, T, 1)
 
-    final = p_gen * gen_prob                                         # (B, T, V)
-    src_index = seq_ids.unsqueeze(1).expand(B, T, seq_ids.size(1))   # (B, T, S)
-    final = final.scatter_add(2, src_index, (1.0 - p_gen) * copy_attn)
-    return torch.log(final.clamp(min=1e-9))
+      final = p_gen * gen_prob                                         # (B, T, V)
+      src_index = seq_ids.unsqueeze(1).expand(B, T, seq_ids.size(1))   # (B, T, S)
+      final = final.scatter_add(2, src_index, (1.0 - p_gen) * copy_attn)
+      return torch.log(final.clamp(min=1e-9))
 
   def _encode_graph_batch(
     self,
@@ -199,18 +203,17 @@ class GCTGCUP(nn.Module):
     src_ids: torch.Tensor,
     edit_ids: torch.Tensor,
     dst_ids: torch.Tensor,
-    old_codes: List[str],
-    new_codes: List[str],
+    code_h: torch.Tensor,
+    code_mask: torch.Tensor,
     graphs: List[ASTDiffGraph],
-    is_long: Optional[torch.Tensor] = None,
   ) -> torch.Tensor:
+    """code_h / code_mask: precomputed GraphCodeBERT code-pair encoding (reused)."""
     device = src_ids.device
 
     seq_enc, seq_mask, seq_ids = self._encode_sequence_modal(src_ids, edit_ids)
     graph_enc, graph_mask = self._encode_graph_batch(graphs, device)
 
-    code_sem, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
-    code_sem = self.fuse_code_sem(code_sem)
+    code_sem = self.fuse_code_sem(code_h)
 
     # Multimodal memory: GraphCodeBERT code semantics + edit/comment seq + AST-GGNN
     memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
@@ -238,7 +241,15 @@ class GCTGCUP(nn.Module):
     teacher_forcing: bool = True,
     pos_weight: Optional[torch.Tensor] = None,
   ) -> Dict[str, torch.Tensor]:
-    det_logits = self.detect(batch["src_methods"], batch["dst_methods"], batch["src_descs"])
+    device = next(self.parameters()).device
+    # Encode code pair ONCE with GraphCodeBERT, then reuse for detection + update.
+    code_h, code_mask = self.code_semantic.encode_code_pair(
+      batch["src_methods"], batch["dst_methods"], device
+    )
+    det_logits = self.detector(
+      batch["src_methods"], batch["dst_methods"], batch["src_descs"],
+      code_cache=(code_h, code_mask),
+    )
     det_loss = F.binary_cross_entropy_with_logits(
       det_logits, batch["labels"], pos_weight=pos_weight
     )
@@ -252,10 +263,9 @@ class GCTGCUP(nn.Module):
         batch["src_ids"][idx],
         batch["edit_ids"][idx],
         batch["dst_ids"][idx],
-        [batch["src_methods"][i] for i in idx.tolist()],
-        [batch["dst_methods"][i] for i in idx.tolist()],
+        code_h[idx],
+        code_mask[idx],
         [batch["graphs"][i] for i in idx.tolist()],
-        batch["is_long"][idx] if "is_long" in batch else None,
       )
       targets = batch["dst_ids"][idx, 1:]
       # NLL over the pointer-generator mixture distribution
@@ -301,7 +311,9 @@ class GCTGCUP(nn.Module):
     comments = comments or [""] * B
     src_descs = src_descs or [""] * B
 
-    det_logits = self.detect(old_codes, new_codes, comments)
+    # Encode code pair ONCE; reuse for detection and every decode step.
+    code_h, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
+    det_logits = self.detector(old_codes, new_codes, comments, code_cache=(code_h, code_mask))
     det_probs = torch.sigmoid(det_logits)
     needs_update = det_probs >= det_threshold
 
@@ -323,10 +335,10 @@ class GCTGCUP(nn.Module):
       # ── Encode inputs (copy source = old comment + edit sequence) ──
       seq_enc, seq_mask, seq_ids = self._encode_sequence_modal(src_ids[i:i+1], edit_ids[i:i+1])
       graph_enc, graph_mask = self._encode_graph_batch([graphs[i]], device)
-      code_sem, code_mask = self.code_semantic.encode_code_pair([old_codes[i]], [new_codes[i]], device)
-      code_sem = self.fuse_code_sem(code_sem)
+      code_sem = self.fuse_code_sem(code_h[i:i+1])           # reuse cached encoding
+      code_mask_i = code_mask[i:i+1]
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
-      mem_mask = torch.cat([code_mask, seq_mask, graph_mask], dim=1)
+      mem_mask = torch.cat([code_mask_i, seq_mask, graph_mask], dim=1)
 
       src_len = int(src_ids[i].ne(self.pad_id).sum().item())
       min_len = max(2, src_len // 3)

@@ -4,7 +4,7 @@ Gap addressed: TG-CUP has no detection stage.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -51,9 +51,15 @@ class OutdatedCommentDetector(nn.Module):
     old_codes: List[str],
     new_codes: List[str],
     comments: List[str],
+    code_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
   ) -> torch.Tensor:
     device = next(self.parameters()).device
-    code_h, code_mask = self.code_encoder.encode_code_pair(old_codes, new_codes, device)
+    # Reuse a precomputed code encoding when available (avoids a duplicate
+    # GraphCodeBERT forward pass per step).
+    if code_cache is not None:
+      code_h, code_mask = code_cache
+    else:
+      code_h, code_mask = self.code_encoder.encode_code_pair(old_codes, new_codes, device)
     com_h_raw, com_mask = self.comment_encoder.encode_comment(comments, device)
     com_h = self.comment_proj(com_h_raw)
 

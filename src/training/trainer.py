@@ -49,6 +49,17 @@ class Trainer:
     self.best_val_loss = float("inf")
     self.epochs_no_improve = 0
     self.scheduler = None
+    self.use_amp = device.type == "cuda"
+    self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
+  def _optimizer_step(self):
+    self.scaler.unscale_(self.optimizer)
+    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+    self.scaler.step(self.optimizer)
+    self.scaler.update()
+    if self.scheduler is not None:
+      self.scheduler.step()
+    self.optimizer.zero_grad()
 
   def train_epoch(self) -> float:
     self.model.train()
@@ -57,24 +68,17 @@ class Trainer:
     self.optimizer.zero_grad()
     for step, batch in enumerate(tqdm(self.train_loader, desc="Train", leave=False)):
       batch = self._to_device(batch)
-      out = self.model(batch, pos_weight=self.pos_weight)
-      loss = out["loss"] / self.grad_accumulation_steps
-      loss.backward()
+      with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        out = self.model(batch, pos_weight=self.pos_weight)
+        loss = out["loss"] / self.grad_accumulation_steps
+      self.scaler.scale(loss).backward()
       total_loss += out["loss"].item()
       n += 1
       if (step + 1) % self.grad_accumulation_steps == 0:
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        if self.scheduler is not None:
-          self.scheduler.step()
-        self.optimizer.zero_grad()
+        self._optimizer_step()
     # final leftover
     if n % self.grad_accumulation_steps != 0:
-      torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-      self.optimizer.step()
-      if self.scheduler is not None:
-        self.scheduler.step()
-      self.optimizer.zero_grad()
+      self._optimizer_step()
     return total_loss / max(n, 1)
 
   @torch.no_grad()
@@ -91,7 +95,8 @@ class Trainer:
       if bi >= self.max_valid_batches:
         break
       batch = self._to_device(batch)
-      out = self.model(batch, pos_weight=self.pos_weight)
+      with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        out = self.model(batch, pos_weight=self.pos_weight)
       total_loss += out["loss"].item()
       n += 1
 
@@ -105,10 +110,13 @@ class Trainer:
       src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
       ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
+      # Greedy decode (beam=1) during training validation for speed;
+      # full beam search is used only in the final scripts/evaluate.py run.
       gen_ids, no_upd_texts, beam_cands = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"],
+        beam_size=1,
         det_threshold=self.det_threshold,
         comments=batch["src_descs"],
         src_descs=src_tok_texts,

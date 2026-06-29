@@ -32,13 +32,13 @@ model:
 
 training:
   batch_size: 16
-  detection_epochs: 15
-  update_epochs: 25
-  max_valid_batches: 60        # cap validation generation cost per epoch
+  detection_epochs: 15         # (unused by current single-phase train.py)
+  update_epochs: 16            # AMP+caching make epochs fast; early-stop usually ~10-12
+  max_valid_batches: 30        # cap validation generation cost per epoch
   learning_rate: 3.0e-4        # for non-BERT params (OneCycle peak)
   graphcodebert_lr: 2.0e-5     # low LR for the pretrained encoder
   weight_decay: 0.01
-  patience: 6
+  patience: 4                  # stop if val loss stalls 4 epochs (saves GPU time)
   grad_accumulation_steps: 2   # effective batch = 16 x 2 = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
