@@ -1,0 +1,22 @@
+{
+  "accuracy": 3.0,
+  "recall_at_5": 3.0,
+  "gleu": 17.81,
+  "meteor": 28.48,
+  "sari": 63.82,
+  "bleu": 16.64,
+  "det_accuracy": 64.4,
+  "det_precision": 49.41,
+  "det_recall": 71.43,
+  "det_f1": 58.41,
+  "nciu_accuracy": 5.04,
+  "long_comment_accuracy": 0.0,
+  "vs_tgcup": {
+    "accuracy": -27.29,
+    "recall_at_5": -35.36,
+    "gleu": -42.83,
+    "meteor": -28.1,
+    "sari": 6.59,
+    "bleu": -60.04
+  }
+}

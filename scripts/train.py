@@ -101,6 +101,7 @@ def main():
     max_valid_batches=cfg["training"].get("max_valid_batches", 10),
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),
+    det_threshold=cfg["model"].get("det_threshold", 0.5),
   )
 
   epochs = args.epochs or cfg["training"]["update_epochs"]

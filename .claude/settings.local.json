@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import src.models.gctgcup; import src.models.detection; import src.training.trainer; print\\('All imports OK'\\)\")"
+      "Bash(python -c \"import src.models.gctgcup; import src.models.detection; import src.training.trainer; print\\('All imports OK'\\)\")",
+      "Bash(python -c \"from src.models.gctgcup import GCTGCUP; from src.training.trainer import Trainer; from src.evaluation.metrics import sari_score; print\\('All OK'\\)\")"
     ]
   }
 }

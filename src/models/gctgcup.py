@@ -22,7 +22,6 @@ from src.data.ast_diff import ASTDiffGraph
 from .detection import OutdatedCommentDetector
 from .ggnn import GGNN
 from .graphcodebert_encoder import GraphCodeBERTEncoder
-from .local_editor import LocalEditDecoder
 
 
 class PositionalEncoding(nn.Module):
@@ -103,8 +102,17 @@ class GCTGCUP(nn.Module):
 
     # fusion projections (TG-CUP Eq. 11-12: attend seq then graph)
     self.fuse_code_sem = nn.Linear(hidden_dim, hidden_dim)
-    self.local_editor = LocalEditDecoder(hidden_dim, vocab_size)
-    self.output_proj = nn.Linear(hidden_dim, vocab_size)
+
+    # ── Output head with weight tying (helps generation under small data) ──
+    self.output_proj = nn.Linear(hidden_dim, vocab_size, bias=False)
+    self.output_proj.weight = self.token_embed.weight  # tie input/output embeddings
+
+    # ── Pointer-generator copy head (new comment ≈ old comment + small edits) ──
+    # Copies tokens from the (old comment + code-edit) source sequence. This is
+    # the main fix for low BLEU/GLEU/METEOR: rare identifiers are copied, not
+    # generated from a huge softmax.
+    self.copy_key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+    self.p_gen = nn.Linear(hidden_dim * 2, 1)
 
   def _embed_seq(self, ids: torch.Tensor) -> torch.Tensor:
     return self.pos_enc(self.token_embed(ids))
@@ -114,8 +122,12 @@ class GCTGCUP(nn.Module):
     comment_ids: torch.Tensor,
     edit_ids: torch.Tensor,
     max_len: int = 512,
-  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """TG-CUP Eq. (6): comment + <sep> + edit sequence."""
+  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """TG-CUP Eq. (6): comment + <sep> + edit sequence.
+
+    Returns (encoded, mask, combined_ids). combined_ids is needed by the
+    pointer-generator copy head to scatter copy-probabilities onto the vocab.
+    """
     sep = torch.full((comment_ids.size(0), 1), 4, dtype=torch.long, device=comment_ids.device)
     combined = torch.cat([comment_ids, sep, edit_ids], dim=1)
     if combined.size(1) > max_len:
@@ -124,7 +136,41 @@ class GCTGCUP(nn.Module):
     emb = self._embed_seq(combined)
     key_padding = ~mask
     encoded = self.seq_encoder(emb, src_key_padding_mask=key_padding)
-    return encoded, mask
+    return encoded, mask, combined
+
+  def _mixture_logprobs(
+    self,
+    decoded: torch.Tensor,
+    seq_enc: torch.Tensor,
+    seq_mask: torch.Tensor,
+    seq_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    """Pointer-generator mixture of generation + copy distributions.
+
+    decoded:  (B, T, D) decoder states
+    seq_enc:  (B, S, D) encoder states of (old comment + edit) source
+    seq_mask: (B, S) bool, True for real tokens
+    seq_ids:  (B, S) vocab ids of the source tokens (for copy scatter)
+    Returns log P(token) of shape (B, T, V).
+    """
+    B, T, _ = decoded.shape
+    V = self.vocab_size
+
+    gen_prob = F.softmax(self.output_proj(decoded), dim=-1)          # (B, T, V)
+
+    keys = self.copy_key(seq_enc)                                    # (B, S, D)
+    scores = torch.bmm(decoded, keys.transpose(1, 2))                # (B, T, S)
+    scores = scores / (self.hidden_dim ** 0.5)
+    scores = scores.masked_fill(~seq_mask.unsqueeze(1), float("-inf"))
+    copy_attn = F.softmax(scores, dim=-1)                            # (B, T, S)
+    context = torch.bmm(copy_attn, seq_enc)                          # (B, T, D)
+
+    p_gen = torch.sigmoid(self.p_gen(torch.cat([decoded, context], dim=-1)))  # (B, T, 1)
+
+    final = p_gen * gen_prob                                         # (B, T, V)
+    src_index = seq_ids.unsqueeze(1).expand(B, T, seq_ids.size(1))   # (B, T, S)
+    final = final.scatter_add(2, src_index, (1.0 - p_gen) * copy_attn)
+    return torch.log(final.clamp(min=1e-9))
 
   def _encode_graph_batch(
     self,
@@ -159,15 +205,14 @@ class GCTGCUP(nn.Module):
     is_long: Optional[torch.Tensor] = None,
   ) -> torch.Tensor:
     device = src_ids.device
-    B = src_ids.size(0)
 
-    seq_enc, seq_mask = self._encode_sequence_modal(src_ids, edit_ids)
+    seq_enc, seq_mask, seq_ids = self._encode_sequence_modal(src_ids, edit_ids)
     graph_enc, graph_mask = self._encode_graph_batch(graphs, device)
 
     code_sem, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
     code_sem = self.fuse_code_sem(code_sem)
 
-    # prepend code semantics to sequence memory
+    # Multimodal memory: GraphCodeBERT code semantics + edit/comment seq + AST-GGNN
     memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
     mem_mask = torch.cat([code_mask, seq_mask, graph_mask], dim=1)
 
@@ -184,8 +229,8 @@ class GCTGCUP(nn.Module):
       memory_key_padding_mask=~mem_mask,
     )
 
-    logits = self.output_proj(decoded)
-    return logits
+    # Pointer-generator: copy over the (old comment + edit) source sequence
+    return self._mixture_logprobs(decoded, seq_enc, seq_mask, seq_ids)
 
   def forward(
     self,
@@ -203,7 +248,7 @@ class GCTGCUP(nn.Module):
 
     if update_mask.any() and teacher_forcing:
       idx = update_mask.nonzero(as_tuple=True)[0]
-      upd_logits = self.forward_update(
+      upd_logprobs = self.forward_update(
         batch["src_ids"][idx],
         batch["edit_ids"][idx],
         batch["dst_ids"][idx],
@@ -213,37 +258,13 @@ class GCTGCUP(nn.Module):
         batch["is_long"][idx] if "is_long" in batch else None,
       )
       targets = batch["dst_ids"][idx, 1:]
-      upd_loss = F.cross_entropy(
-        upd_logits.reshape(-1, self.vocab_size),
+      # NLL over the pointer-generator mixture distribution
+      upd_loss = F.nll_loss(
+        upd_logprobs.reshape(-1, self.vocab_size),
         targets.reshape(-1),
         ignore_index=self.pad_id,
-        label_smoothing=0.1,
       )
-      # Edit-aware loss: reward both copy (kept tokens) and novel tokens (added)
-      # This teaches the model to selectively keep AND delete, improving SARI
-      src_batch = batch["src_ids"][idx]
-      token_loss = F.cross_entropy(
-        upd_logits.reshape(-1, self.vocab_size),
-        targets.reshape(-1),
-        ignore_index=self.pad_id,
-        reduction='none',
-      ).view(targets.size())
-      edit_weight = torch.ones_like(targets, dtype=torch.float)
-      for b in range(targets.size(0)):
-        src_set = set(src_batch[b].tolist()) - {0, 1, 2, 3, 4}
-        dst_set = set(targets[b].tolist()) - {0, 1, 2, 3, 4}
-        for t in range(targets.size(1)):
-          tok = targets[b, t].item()
-          if tok == self.pad_id:
-            edit_weight[b, t] = 0.0
-          elif tok in src_set and tok in dst_set:
-            edit_weight[b, t] = 1.0   # kept token
-          elif tok not in src_set and tok in dst_set:
-            edit_weight[b, t] = 2.0   # added token (harder, more reward)
-      weighted_loss = (token_loss * edit_weight).sum() / edit_weight.sum().clamp(min=1)
-      upd_loss = 0.6 * upd_loss + 0.4 * weighted_loss
       result["upd_loss"] = upd_loss
-      result["upd_logits"] = upd_logits
     else:
       result["upd_loss"] = torch.tensor(0.0, device=det_logits.device)
 
@@ -299,20 +320,18 @@ class GCTGCUP(nn.Module):
 
       no_update_texts.append(None)
 
-      # ── Encode inputs ──
-      seq_enc, seq_mask = self._encode_sequence_modal(src_ids[i:i+1], edit_ids[i:i+1])
+      # ── Encode inputs (copy source = old comment + edit sequence) ──
+      seq_enc, seq_mask, seq_ids = self._encode_sequence_modal(src_ids[i:i+1], edit_ids[i:i+1])
       graph_enc, graph_mask = self._encode_graph_batch([graphs[i]], device)
       code_sem, code_mask = self.code_semantic.encode_code_pair([old_codes[i]], [new_codes[i]], device)
       code_sem = self.fuse_code_sem(code_sem)
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask, seq_mask, graph_mask], dim=1)
 
-      # ── Pre-compute source token info ──
-      src_token_set = set(src_ids[i].tolist()) - {0, 1, 2, 3, 4}
-      src_len = int(src_ids[i].ne(0).sum().item())
-      min_len = max(3, src_len // 2)
+      src_len = int(src_ids[i].ne(self.pad_id).sum().item())
+      min_len = max(2, src_len // 3)
 
-      # ── Beam search ──
+      # ── Length-normalized beam search over the copy-mixture distribution ──
       beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
       completed: List[tuple] = []
 
@@ -320,7 +339,6 @@ class GCTGCUP(nn.Module):
         if not beams:
           break
         new_beams: List[tuple] = []
-
         for seq, score in beams:
           if seq[0, -1].item() == self.eos_id:
             completed.append((seq, score))
@@ -332,65 +350,31 @@ class GCTGCUP(nn.Module):
             tgt=tgt_emb, memory=memory, tgt_mask=tgt_mask,
             memory_key_padding_mask=~mem_mask,
           )
-          log_probs = F.log_softmax(self.output_proj(dec[:, -1]), dim=-1)
+          log_probs = self._mixture_logprobs(dec[:, -1:], seq_enc, seq_mask, seq_ids)[0, -1]
 
-          # Soft copy boost (reduced from 1.0 to 0.4 to allow deletions for SARI)
-          for tok_id in src_token_set:
-            if tok_id < log_probs.size(-1):
-              log_probs[0, tok_id] += 0.4
+          # Light penalty against repeating the immediately previous token
+          prev = seq[0, -1].item()
+          if prev not in (self.sos_id, self.eos_id, self.pad_id):
+            log_probs[prev] -= 0.6
 
-          # Repetition penalty for non-source tokens only
-          seen = set(seq[0].tolist()) - src_token_set
-          for tok_id in seen:
-            if tok_id < log_probs.size(-1):
-              log_probs[0, tok_id] -= 1.2
-
-          # Block EOS until minimum length reached
           if seq.size(1) <= min_len:
-            log_probs[0, self.eos_id] -= 1e9
+            log_probs[self.eos_id] -= 1e9
 
           seq_len = seq.size(1)
           topk = torch.topk(log_probs, beam_size, dim=-1)
           for k in range(beam_size):
-            tok = topk.indices[0, k].unsqueeze(0).unsqueeze(0)
-            new_score = (score * seq_len + topk.values[0, k].item()) / (seq_len + 1)
+            tok = topk.indices[k].view(1, 1)
+            new_score = (score * seq_len + topk.values[k].item()) / (seq_len + 1)
             new_beams.append((torch.cat([seq, tok], dim=1), new_score))
 
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
         if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
 
-      # ── Edit-quality reranking for SARI/GLEU improvement ──
-      # Combines LM score with edit quality (rewards balanced keep+delete+add)
-      all_finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
-
-      def edit_quality(cand_ids: List[int]) -> float:
-        cand_set = set(cand_ids) - {0, 1, 2, 3, 4}
-        if not src_token_set:
-          return 0.0
-        kept = len(cand_set & src_token_set)
-        deleted = len(src_token_set - cand_set)
-        added = len(cand_set - src_token_set)
-        keep_ratio = kept / len(src_token_set)
-        edit_ratio = (deleted + added) / max(len(src_token_set) + len(cand_set), 1)
-        # Reward: close to source length, makes some meaningful edits
-        keep_score = 1.0 - abs(keep_ratio - 0.8) * 2
-        return 0.4 * edit_ratio + 0.6 * max(keep_score, 0.0)
-
-      reranked = []
-      for seq, lm_score in all_finished:
-        cand = [t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)]
-        eq = edit_quality(cand)
-        # Weighted combination: LM score (primary) + edit quality (secondary)
-        combined = 0.75 * lm_score + 0.25 * eq
-        reranked.append((seq, lm_score, combined, cand))
-
-      reranked.sort(key=lambda x: x[2], reverse=True)
-      best_tok_ids = reranked[0][3]
-      beam_cands = [r[3] for r in reranked]
-
-      token_ids.append(best_tok_ids)
-      beam_results.append(beam_cands)
+      finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
+      cands = [[t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)] for seq, _ in finished]
+      token_ids.append(cands[0] if cands else [])
+      beam_results.append(cands if cands else [[]])
 
     if return_beam_candidates:
       return token_ids, no_update_texts, beam_results

@@ -30,6 +30,7 @@ class Trainer:
     max_valid_batches: int = 10,
     pos_weight: Optional[torch.Tensor] = None,
     grad_accumulation_steps: int = 4,
+    det_threshold: float = 0.5,
   ):
     self.model = model.to(device)
     self.train_loader = train_loader
@@ -40,6 +41,7 @@ class Trainer:
     self.patience = patience
     self.vocab = vocab
     self.max_valid_batches = max_valid_batches
+    self.det_threshold = det_threshold
     # move pos_weight to device
     self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
     self.grad_accumulation_steps = grad_accumulation_steps
@@ -94,22 +96,27 @@ class Trainer:
       n += 1
 
       det_logits = out["det_logits"]
-      preds = (torch.sigmoid(det_logits) >= 0.45).long().cpu().tolist()
+      preds = (torch.sigmoid(det_logits) >= self.det_threshold).long().cpu().tolist()
       labels = batch["labels"].long().cpu().tolist()
       det_preds.extend(preds)
       det_labels.extend(labels)
+
+      # Token-space src/ref so generated predictions and references are comparable
+      src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
+      ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
       gen_ids, no_upd_texts, beam_cands = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"],
+        det_threshold=self.det_threshold,
         comments=batch["src_descs"],
-        src_descs=batch["src_descs"],
+        src_descs=src_tok_texts,
         return_beam_candidates=True,
       )
 
       for ids, no_upd, cands, ref, src in zip(
-        gen_ids, no_upd_texts, beam_cands, batch["dst_descs"], batch["src_descs"]
+        gen_ids, no_upd_texts, beam_cands, ref_tok_texts, src_tok_texts
       ):
         if no_upd is not None:
           # No update predicted: return original comment directly (no tokenization loss)

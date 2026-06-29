@@ -1,0 +1,56 @@
+# GC-TGCUP — Kaggle GPU config (target: BEAT TG-CUP).
+# GraphCodeBERT is fine-tuned (mandatory), full-size model, larger data.
+project_name: "GC-TGCUP"
+
+data:
+  raw_dir: "cup2_dataset"
+  processed_dir: "data/processed"
+  max_samples: 20000           # raise for the final run (e.g. 40000+) if time allows
+  train_ratio: 0.8
+  valid_ratio: 0.1
+  test_ratio: 0.1
+  max_code_len: 256
+  max_comment_len: 128
+  max_edit_len: 512
+  long_comment_threshold: 25
+  min_comment_len: 3
+  seed: 42
+  vocab_max_size: 30000        # closed vocab from training comments
+
+model:
+  hidden_dim: 256              # full TG-CUP-scale hidden size
+  num_heads: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  ggnn_steps: 6                # TG-CUP uses 6 GGNN propagation steps
+  dropout: 0.2
+  graphcodebert: "microsoft/graphcodebert-base"
+  freeze_graphcodebert: false  # MANDATORY: fine-tune GraphCodeBERT on GPU
+  beam_size: 5
+  max_decode_len: 50
+  det_threshold: 0.5
+
+training:
+  batch_size: 16
+  detection_epochs: 15
+  update_epochs: 25
+  max_valid_batches: 60        # cap validation generation cost per epoch
+  learning_rate: 3.0e-4        # for non-BERT params (OneCycle peak)
+  graphcodebert_lr: 2.0e-5     # low LR for the pretrained encoder
+  weight_decay: 0.01
+  patience: 6
+  grad_accumulation_steps: 2   # effective batch = 16 x 2 = 32
+  device: "auto"
+  checkpoint_dir: "checkpoints"
+  pos_weight: 2.0              # neg/pos ≈ 65/35 from balanced sampling
+
+evaluation:
+  metrics: [accuracy, recall_at_5, gleu, meteor, sari, bleu]
+  detection_metrics: [accuracy, precision, recall, f1]
+  tgcup_baseline:
+    accuracy: 30.29
+    recall_at_5: 38.36
+    gleu: 60.64
+    meteor: 56.58
+    sari: 57.23
+    bleu: 76.68

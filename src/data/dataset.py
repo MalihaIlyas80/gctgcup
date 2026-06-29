@@ -95,6 +95,39 @@ def tokenize_comment(text: str) -> List[str]:
     return [t for t in re.findall(r"\w+|<con>|[^\w\s]", text) if t.strip()]
 
 
+def _sample_comment_tokens(s: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+  """Tokens actually fed to the model (mirror CUPDataset.__getitem__)."""
+  src_tokens = s.get("src_desc_tokens") or tokenize_comment(s.get("src_desc", ""))
+  dst_tokens = s.get("dst_desc_tokens") or tokenize_comment(s.get("dst_desc", ""))
+  return src_tokens, dst_tokens
+
+
+def build_vocabulary(train_samples: List[Dict[str, Any]], max_size: int = 30000) -> "Vocabulary":
+  """
+  Build a CLOSED vocabulary from the training comments only.
+
+  This is the single most important fix vs the old 100k mix_vocab: with a few
+  thousand training samples, a 100k-token output softmax never trains, which
+  collapses BLEU/GLEU/METEOR. A data-driven vocab (~8-15k) keeps the output
+  layer fully trainable, and the pointer-generator copy head handles any rare
+  out-of-vocabulary identifiers at inference time.
+  """
+  from collections import Counter
+
+  counter: Counter = Counter()
+  for s in train_samples:
+    src_tokens, dst_tokens = _sample_comment_tokens(s)
+    counter.update(src_tokens)
+    counter.update(dst_tokens)
+
+  vocab = Vocabulary()  # special tokens occupy ids 0..len(SPECIAL_TOKENS)-1
+  for tok, _freq in counter.most_common():
+    if len(vocab) >= max_size:
+      break
+    vocab.add_token(tok)
+  return vocab
+
+
 class CUPDataset(Dataset):
   """Single split of comment-update data."""
 
@@ -254,6 +287,7 @@ def prepare_datasets(
   train_ratio: float = 0.8,
   valid_ratio: float = 0.1,
   seed: int = 42,
+  vocab_max_size: int = 30000,
 ) -> Tuple[CUPDataset, CUPDataset, CUPDataset, Vocabulary]:
   os.makedirs(processed_dir, exist_ok=True)
   cleaner = CommentCleaner()
@@ -287,16 +321,9 @@ def prepare_datasets(
   rng.shuffle(valid_s)
   rng.shuffle(test_s)
 
-  # build vocabulary from mix_vocab if available
-  mix_vocab_path = os.path.join(raw_dir, "mix_vocab.json")
-  if os.path.exists(mix_vocab_path):
-    vocab = Vocabulary.from_mix_vocab(mix_vocab_path)
-  else:
-    vocab = Vocabulary()
-    for s in train_s:
-      for tok in tokenize_comment(s["src_desc"]) + tokenize_comment(s["dst_desc"]):
-        vocab.add_token(tok)
-
+  # Build a CLOSED vocabulary from training comments (NOT the 100k mix_vocab).
+  # This keeps the output softmax trainable; the copy head covers rare OOV tokens.
+  vocab = build_vocabulary(train_s, max_size=vocab_max_size)
   vocab.save(os.path.join(processed_dir, "vocab.json"))
 
   stats = {
@@ -307,6 +334,7 @@ def prepare_datasets(
     "positive": sum(1 for s in all_samples if s.get("label")),
     "negative": sum(1 for s in all_samples if not s.get("label")),
     "nciu": sum(1 for s in all_samples if s.get("is_nciu")),
+    "vocab_size": len(vocab),
   }
   with open(os.path.join(processed_dir, "stats.json"), "w") as f:
     json.dump(stats, f, indent=2)

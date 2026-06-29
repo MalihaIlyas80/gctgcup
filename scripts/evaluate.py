@@ -25,7 +25,7 @@ def load_jsonl(path):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, vocab, device):
+def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5):
   model.eval()
   predictions, references, sources = [], [], []
   det_preds, det_labels = [], []
@@ -38,21 +38,26 @@ def evaluate_model(model, loader, vocab, device):
         batch[k] = v.to(device)
 
     det_logits = model.detect(batch["src_methods"], batch["dst_methods"], batch["src_descs"])
-    preds = (torch.sigmoid(det_logits) >= 0.45).long().cpu().tolist()
+    preds = (torch.sigmoid(det_logits) >= det_threshold).long().cpu().tolist()
     det_preds.extend(preds)
     det_labels.extend(batch["labels"].long().cpu().tolist())
+
+    # Token-space src/ref so generated predictions and references are comparable
+    src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
+    ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
     gen_ids, no_upd_texts, beam_ids = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
       batch["graphs"],
-      max_len=50, beam_size=5,
+      max_len=50, beam_size=beam_size,
+      det_threshold=det_threshold,
       comments=batch["src_descs"],
-      src_descs=batch["src_descs"],
+      src_descs=src_tok_texts,
       return_beam_candidates=True,
     )
     for ids, no_upd, cands, ref, src in zip(
-      gen_ids, no_upd_texts, beam_ids, batch["dst_descs"], batch["src_descs"]
+      gen_ids, no_upd_texts, beam_ids, ref_tok_texts, src_tok_texts
     ):
       if no_upd is not None:
         # No update predicted: use original comment directly (exact match preserved)
@@ -140,7 +145,11 @@ def main():
   else:
     print("WARNING: No checkpoint found – evaluating untrained model.")
 
-  metrics = evaluate_model(model, test_loader, vocab, device)
+  metrics = evaluate_model(
+    model, test_loader, vocab, device,
+    det_threshold=cfg["model"].get("det_threshold", 0.5),
+    beam_size=cfg["model"].get("beam_size", 5),
+  )
   print_comparison(metrics, cfg["evaluation"]["tgcup_baseline"])
 
   report = metrics.to_dict()
