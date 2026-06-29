@@ -19,6 +19,40 @@ import torch
 import torch.nn as nn
 
 
+def _load_codet5_tokenizer(model_name: str):
+  """Load CodeT5's tokenizer robustly across transformers versions.
+
+  CodeT5 ships a RoBERTa-style BPE tokenizer (vocab.json + merges.txt) and no
+  fast `tokenizer.json`.  On some (newer) transformers versions AutoTokenizer
+  fails: the slow->fast conversion asks for sentencepiece, and the slow path
+  itself raises `extra_special_tokens must be ...`.  RobertaTokenizerFast builds
+  the fast tokenizer directly from vocab+merges and sidesteps both issues.
+  """
+  errors = []
+  # 1) Fast RoBERTa tokenizer straight from vocab.json + merges.txt.
+  try:
+    from transformers import RobertaTokenizerFast
+    return RobertaTokenizerFast.from_pretrained(model_name)
+  except Exception as e:  # noqa: BLE001
+    errors.append(f"RobertaTokenizerFast: {e}")
+  # 2) Generic Auto (fast).
+  try:
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(model_name)
+  except Exception as e:  # noqa: BLE001
+    errors.append(f"AutoTokenizer(fast): {e}")
+  # 3) Generic Auto (slow).
+  try:
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(model_name, use_fast=False)
+  except Exception as e:  # noqa: BLE001
+    errors.append(f"AutoTokenizer(slow): {e}")
+  raise RuntimeError(
+    "Could not load CodeT5 tokenizer for '%s'. Tried:\n  - %s"
+    % (model_name, "\n  - ".join(errors))
+  )
+
+
 class UpdateT5(nn.Module):
   def __init__(
     self,
@@ -27,9 +61,9 @@ class UpdateT5(nn.Module):
     max_tgt_len: int = 64,
   ):
     super().__init__()
-    from transformers import AutoTokenizer, T5ForConditionalGeneration
+    from transformers import T5ForConditionalGeneration
 
-    self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+    self.tokenizer = _load_codet5_tokenizer(model_name)
     self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
     self.max_src_len = max_src_len
     self.max_tgt_len = max_tgt_len
