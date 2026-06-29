@@ -14,7 +14,7 @@ data:
   long_comment_threshold: 25   # tokens – triggers long-comment subgroup metric
   min_comment_len: 3
   seed: 42
-  vocab_max_size: 30000        # closed vocab built from training comments
+  vocab_max_size: 16000        # byte-level BPE vocab size (no OOV)
 
 model:
   hidden_dim: 128              # halved: 4x less compute in attention layers

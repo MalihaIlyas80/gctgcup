@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.data.dataset import CUPDataset, Vocabulary, collate_fn
+from src.data.dataset import CUPDataset, collate_fn
+from src.data.tokenizer import SubwordTokenizer
 from src.models.gctgcup import GCTGCUP
 from src.training.trainer import Trainer
 
@@ -58,10 +59,10 @@ def main():
     torch.set_num_interop_threads(max(1, n_threads // 2))
     print(f"CPU threads: {n_threads} intra / {max(1, n_threads // 2)} inter")
 
-  vocab = Vocabulary.load(os.path.join(args.processed_dir, "vocab.json"))
-  train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")), vocab,
+  tokenizer = SubwordTokenizer.load(os.path.join(args.processed_dir, "tokenizer.json"))
+  train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")), tokenizer,
                         long_threshold=cfg["data"]["long_comment_threshold"])
-  valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")), vocab,
+  valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")), tokenizer,
                         long_threshold=cfg["data"]["long_comment_threshold"])
 
   num_workers = min(4, (os.cpu_count() or 1) // 2)
@@ -73,7 +74,7 @@ def main():
                             persistent_workers=num_workers > 0)
 
   model = GCTGCUP(
-    vocab_size=len(vocab),
+    vocab_size=len(tokenizer),
     hidden_dim=cfg["model"]["hidden_dim"],
     num_heads=cfg["model"]["num_heads"],
     num_encoder_layers=cfg["model"]["num_encoder_layers"],
@@ -97,7 +98,7 @@ def main():
     model, train_loader, valid_loader, optimizer, device,
     checkpoint_dir=cfg["training"]["checkpoint_dir"],
     patience=cfg["training"]["patience"],
-    vocab=vocab,
+    tokenizer=tokenizer,
     max_valid_batches=cfg["training"].get("max_valid_batches", 10),
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),

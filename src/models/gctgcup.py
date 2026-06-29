@@ -332,29 +332,27 @@ class GCTGCUP(nn.Module):
     det_threshold: float = 0.45,
     comments: Optional[List[str]] = None,
     src_descs: Optional[List[str]] = None,
-    copy_src_tokens: Optional[List[List[str]]] = None,
-    id2token: Optional[Dict[int, str]] = None,
+    decode_fn=None,
     force_update: bool = False,
   ) -> Tuple[List[str], List[List[str]]]:
-    """Generate updated comments (extended-vocabulary pointer-generator).
+    """Generate updated comments via beam search, decoding to text.
 
-    Decodes directly to SURFACE STRINGS. In-vocabulary tokens use id2token;
-    when the model emits <unk> (an out-of-vocab identifier it wants to copy),
-    we emit the actual source token at the highest copy-attention position.
-    This is what lets the model reproduce renamed identifiers verbatim and is
-    the key fix for near-zero exact-match accuracy.
+    With byte-level BPE there is no OOV: the copy mixture already places mass on
+    the correct in-vocab subword id, so we beam-search over ids and detokenize
+    with decode_fn (the tokenizer's decoder). decode_fn: List[int] -> str.
 
     force_update=True bypasses the detection gate (TG-CUP-style: always update).
 
     Returns:
-      pred_texts:  List[str]            — best predicted comment per sample
-      beam_texts:  List[List[str]]      — beam candidates per sample (for Recall@k)
+      pred_texts:  List[str]        — best predicted comment per sample
+      beam_texts:  List[List[str]]  — beam candidates per sample (for Recall@k)
     """
     device = src_ids.device
     B = src_ids.size(0)
     comments = comments or [""] * B
     src_descs = src_descs or [""] * B
-    id2token = id2token or {}
+    if decode_fn is None:
+      decode_fn = lambda ids: " ".join(str(t) for t in ids)
 
     code_h, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
     det_logits = self.detector(old_codes, new_codes, comments, code_cache=(code_h, code_mask))
@@ -364,17 +362,6 @@ class GCTGCUP(nn.Module):
 
     pred_texts: List[str] = []
     beam_texts: List[List[str]] = []
-
-    def _surface(tok_id: int, cattn: torch.Tensor, oov_mask: torch.Tensor,
-                 csrc: Optional[List[str]]) -> Optional[str]:
-      """Map a chosen token id to its surface string (None => skip/stop)."""
-      if tok_id in (self.pad_id, self.sos_id, self.eos_id, 4):  # 4 = <sep>
-        return None
-      if tok_id == self.unk_id and csrc is not None and bool(oov_mask.any()):
-        masked = cattn.masked_fill(~oov_mask, float("-inf"))
-        p = int(masked.argmax().item())
-        return csrc[p] if p < len(csrc) else "<unk>"
-      return id2token.get(tok_id, "<unk>")
 
     for i in range(B):
       if not needs_update[i]:
@@ -388,22 +375,17 @@ class GCTGCUP(nn.Module):
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask[i:i+1], seq_mask, graph_mask], dim=1)
 
-      S = seq_ids.size(1)
-      ids_row = seq_ids[0]
-      oov_mask = ids_row.eq(self.unk_id) & seq_mask[0]                 # (S,)
-      csrc = copy_src_tokens[i][:S] if copy_src_tokens is not None else None
-
-      # beam = (ids_tensor, surface_tokens, score)
-      beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), [], 0.0)]
+      # beam = (ids_tensor, score)
+      beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
       completed: List[tuple] = []
 
       for _ in range(max_len):
         if not beams:
           break
         new_beams: List[tuple] = []
-        for seq, surf, score in beams:
+        for seq, score in beams:
           if seq[0, -1].item() == self.eos_id:
-            completed.append((seq, surf, score))
+            completed.append((seq, score))
             continue
 
           tgt_emb = self._embed_seq(seq)
@@ -412,11 +394,7 @@ class GCTGCUP(nn.Module):
             tgt=tgt_emb, memory=memory, tgt_mask=tgt_mask,
             memory_key_padding_mask=~mem_mask,
           )
-          log_probs, copy_attn = self._mixture_logprobs(
-            dec[:, -1:], seq_enc, seq_mask, seq_ids, return_copy=True
-          )
-          log_probs = log_probs[0, -1]
-          cattn = copy_attn[0, -1]                                    # (S,)
+          log_probs = self._mixture_logprobs(dec[:, -1:], seq_enc, seq_mask, seq_ids)[0, -1]
 
           # Block degenerate loops (same token 3x in a row).
           if seq.size(1) >= 2:
@@ -430,19 +408,19 @@ class GCTGCUP(nn.Module):
           seq_len = seq.size(1)
           topk = torch.topk(log_probs, beam_size, dim=-1)
           for k in range(beam_size):
-            tid = int(topk.indices[k].item())
             tok = topk.indices[k].view(1, 1)
             new_score = (score * seq_len + topk.values[k].item()) / (seq_len + 1)
-            s = _surface(tid, cattn, oov_mask, csrc)
-            new_surf = surf + [s] if s is not None else surf
-            new_beams.append((torch.cat([seq, tok], dim=1), new_surf, new_score))
+            new_beams.append((torch.cat([seq, tok], dim=1), new_score))
 
-        beams = sorted(new_beams, key=lambda x: x[2], reverse=True)[:beam_size]
-        if all(s[0, -1].item() == self.eos_id for s, _, _ in beams):
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+        if all(s[0, -1].item() == self.eos_id for s, _ in beams):
           break
 
-      finished = sorted(completed + beams, key=lambda x: x[2], reverse=True)[:beam_size]
-      cand_texts = [" ".join(surf) for _, surf, _ in finished] or [""]
+      finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
+      cand_id_lists = [
+        [t for t in seq[0, 1:].tolist() if t != self.eos_id] for seq, _ in finished
+      ] or [[]]
+      cand_texts = [decode_fn(ids) for ids in cand_id_lists]
       pred_texts.append(cand_texts[0])
       beam_texts.append(cand_texts)
 

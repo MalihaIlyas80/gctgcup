@@ -15,7 +15,7 @@ data:
   long_comment_threshold: 25
   min_comment_len: 3
   seed: 42
-  vocab_max_size: 30000        # closed vocab from training comments
+  vocab_max_size: 16000        # byte-level BPE vocab size (no OOV)
 
 model:
   hidden_dim: 256              # full TG-CUP-scale hidden size

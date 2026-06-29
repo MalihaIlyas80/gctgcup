@@ -26,7 +26,7 @@ class Trainer:
     device: torch.device,
     checkpoint_dir: str = "checkpoints",
     patience: int = 5,
-    vocab=None,
+    tokenizer=None,
     max_valid_batches: int = 10,
     pos_weight: Optional[torch.Tensor] = None,
     grad_accumulation_steps: int = 4,
@@ -39,7 +39,8 @@ class Trainer:
     self.device = device
     self.checkpoint_dir = checkpoint_dir
     self.patience = patience
-    self.vocab = vocab
+    self.tokenizer = tokenizer
+    self.decode_fn = tokenizer.decode if tokenizer is not None else (lambda ids: " ".join(map(str, ids)))
     self.max_valid_batches = max_valid_batches
     self.det_threshold = det_threshold
     # move pos_weight to device
@@ -107,9 +108,9 @@ class Trainer:
       det_preds.extend(preds)
       det_labels.extend(labels)
 
-      # Token-space src/ref so generated predictions and references are comparable
-      src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
-      ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
+      # Detokenized src/ref (same space as predictions) for fair exact-match.
+      src_texts = [self.decode_fn(ids.tolist()) for ids in batch["src_ids"]]
+      ref_texts = [self.decode_fn(ids.tolist()) for ids in batch["dst_ids"]]
 
       # Greedy decode (beam=1) during training validation for speed;
       # full beam search is used only in the final scripts/evaluate.py run.
@@ -122,13 +123,12 @@ class Trainer:
         beam_size=1,
         det_threshold=self.det_threshold,
         comments=batch["src_descs"],
-        src_descs=src_tok_texts,
-        copy_src_tokens=batch["copy_src_tokens_list"],
-        id2token=self.vocab.id2token if self.vocab else None,
+        src_descs=src_texts,
+        decode_fn=self.decode_fn,
         force_update=True,
       )
 
-      for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_tok_texts, src_tok_texts):
+      for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_texts, src_texts):
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)

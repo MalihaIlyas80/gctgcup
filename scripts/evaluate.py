@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.data.dataset import CUPDataset, Vocabulary, collate_fn
+from src.data.dataset import CUPDataset, collate_fn
+from src.data.tokenizer import SubwordTokenizer
 from src.evaluation.metrics import compute_all_metrics
 from src.models.gctgcup import GCTGCUP
 
@@ -25,14 +26,13 @@ def load_jsonl(path):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5):
+def evaluate_model(model, loader, tokenizer, device, det_threshold=0.5, beam_size=5):
   model.eval()
+  decode_fn = tokenizer.decode
   predictions, references, sources = [], [], []
   det_preds, det_labels = [], []
   is_nciu, is_long, outdated = [], [], []
   beam_cands = []
-  oov_ref_outdated = 0          # outdated refs containing >=1 OOV token
-  n_outdated_seen = 0
 
   for batch in loader:
     for k, v in batch.items():
@@ -45,12 +45,11 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
     labels = batch["labels"].long().cpu().tolist()
     det_labels.extend(labels)
 
-    # Token-space src/ref so generated predictions and references are comparable
-    src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
-    ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
+    # Detokenized src/ref (same text space as predictions) for fair exact-match.
+    src_texts = [decode_fn(ids.tolist()) for ids in batch["src_ids"]]
+    ref_texts = [decode_fn(ids.tolist()) for ids in batch["dst_ids"]]
 
     # force_update=True -> always generate (TG-CUP-style pure update quality).
-    # Extended-vocab pointer-generator decodes straight to surface strings.
     pred_texts, beam_b = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
@@ -58,40 +57,27 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
       max_len=50, beam_size=beam_size,
       det_threshold=det_threshold,
       comments=batch["src_descs"],
-      src_descs=src_tok_texts,
-      copy_src_tokens=batch["copy_src_tokens_list"],
-      id2token=vocab.id2token,
+      src_descs=src_texts,
+      decode_fn=decode_fn,
       force_update=True,
     )
-    for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_tok_texts, src_tok_texts):
+    for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_texts, src_texts):
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
       beam_cands.append(cands)
 
-    # OOV diagnostic on the outdated references (the exact-match ceiling)
-    for lab, toks in zip(labels, batch["dst_tokens_list"]):
-      if lab == 1:
-        n_outdated_seen += 1
-        if any(t not in vocab.token2id for t in toks):
-          oov_ref_outdated += 1
-
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())
     outdated.extend(labels)
 
-  metrics = compute_all_metrics(
+  return compute_all_metrics(
     predictions, references, sources,
     beam_candidates=beam_cands,
     det_preds=det_preds, det_labels=det_labels,
     is_nciu=is_nciu, is_long=is_long,
     outdated=outdated,
   )
-  oov_pct = oov_ref_outdated / max(n_outdated_seen, 1) * 100
-  print(f"\n[diagnostic] outdated refs with >=1 OOV token: "
-        f"{oov_ref_outdated}/{n_outdated_seen} ({oov_pct:.1f}%) "
-        f"-> theoretical exact-match ceiling ~= {100 - oov_pct:.1f}%")
-  return metrics
 
 
 def print_comparison(metrics, baseline):
@@ -146,13 +132,14 @@ def main():
     cfg = yaml.safe_load(f)
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  vocab = Vocabulary.load(os.path.join(args.processed_dir, "vocab.json"))
-  test_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "test.jsonl")), vocab)
+  tokenizer = SubwordTokenizer.load(os.path.join(args.processed_dir, "tokenizer.json"))
+  test_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "test.jsonl")), tokenizer,
+                       long_threshold=cfg["data"]["long_comment_threshold"])
   test_loader = DataLoader(test_ds, batch_size=cfg["training"]["batch_size"],
                            shuffle=False, collate_fn=collate_fn)
 
   model = GCTGCUP(
-    vocab_size=len(vocab),
+    vocab_size=len(tokenizer),
     hidden_dim=cfg["model"]["hidden_dim"],
     num_heads=cfg["model"]["num_heads"],
     num_encoder_layers=cfg["model"]["num_encoder_layers"],
@@ -171,7 +158,7 @@ def main():
     print("WARNING: No checkpoint found – evaluating untrained model.")
 
   metrics = evaluate_model(
-    model, test_loader, vocab, device,
+    model, test_loader, tokenizer, device,
     det_threshold=cfg["model"].get("det_threshold", 0.5),
     beam_size=cfg["model"].get("beam_size", 5),
   )

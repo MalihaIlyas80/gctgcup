@@ -21,6 +21,13 @@ from .cleaning import (
     flatten_edit_sequence,
     is_valid_sample,
 )
+from .tokenizer import SubwordTokenizer
+
+
+def build_edit_text(s: Dict[str, Any]) -> str:
+  """Flatten a sample's code-change sequence into a single edit string."""
+  old_t, new_t, acts = build_edit_sequence(s.get("code_change_seq", []))
+  return " ".join(flatten_edit_sequence(old_t, new_t, acts))
 
 SPECIAL_TOKENS = [
     "<pad>", "<s>", "</s>", "<unk>", "<sep>",
@@ -134,14 +141,14 @@ class CUPDataset(Dataset):
   def __init__(
     self,
     samples: List[Dict[str, Any]],
-    vocab: Vocabulary,
+    tokenizer: "SubwordTokenizer",
     max_comment_len: int = 128,
     max_edit_len: int = 512,
     long_threshold: int = 25,
     build_graphs: bool = True,
   ):
     self.samples = samples
-    self.vocab = vocab
+    self.tokenizer = tokenizer
     self.max_comment_len = max_comment_len
     self.max_edit_len = max_edit_len
     self.long_threshold = long_threshold
@@ -152,43 +159,29 @@ class CUPDataset(Dataset):
 
   def __getitem__(self, idx: int) -> Dict[str, Any]:
     s = self.samples[idx]
-    src_tokens = s.get("src_desc_tokens") or tokenize_comment(s["src_desc"])
-    dst_tokens = s.get("dst_desc_tokens") or tokenize_comment(s["dst_desc"])
+    tok = self.tokenizer
+    src_text = s.get("src_desc", "") or ""
+    dst_text = s.get("dst_desc", "") or ""
+    edit_text = build_edit_text(s)
 
-    old_t, new_t, acts = build_edit_sequence(s.get("code_change_seq", []))
-    edit_flat = flatten_edit_sequence(old_t, new_t, acts)
-
-    src_ids = self.vocab.encode(src_tokens[: self.max_comment_len])
-    dst_ids = self.vocab.encode(dst_tokens[: self.max_comment_len])
-    edit_ids = self.vocab.encode(edit_flat[: self.max_edit_len], add_special=False)
-    edit_ids = [self.vocab.token2id["<s>"]] + edit_ids + [self.vocab.token2id["</s>"]]
-
-    # Surface tokens of the copy source (old comment + <sep> + edit sequence),
-    # aligned 1:1 with the ids built above. Used by the extended-vocabulary
-    # pointer-generator at inference to copy OOV identifiers verbatim instead of
-    # emitting <unk> (the cause of near-zero exact-match accuracy).
-    copy_src_tokens = (
-      ["<s>"] + src_tokens[: self.max_comment_len] + ["</s>"]
-      + ["<sep>"]
-      + ["<s>"] + edit_flat[: self.max_edit_len] + ["</s>"]
-    )
+    # Byte-level BPE: no OOV, loss-less encode<->decode.
+    src_ids = tok.encode_with_special(src_text, self.max_comment_len)
+    dst_ids = tok.encode_with_special(dst_text, self.max_comment_len)
+    edit_ids = tok.encode_with_special(edit_text, self.max_edit_len)
 
     label = int(bool(s.get("label", True)))
-    is_long = len(src_tokens) > self.long_threshold
+    is_long = len(src_text.split()) > self.long_threshold
     is_nciu = bool(s.get("is_nciu", False))
 
     item: Dict[str, Any] = {
       "idx": s.get("idx", idx),
-      "src_desc": s["src_desc"],
-      "dst_desc": s["dst_desc"],
+      "src_desc": src_text,
+      "dst_desc": dst_text,
       "src_method": s["src_method"],
       "dst_method": s["dst_method"],
       "src_ids": torch.tensor(src_ids, dtype=torch.long),
       "dst_ids": torch.tensor(dst_ids, dtype=torch.long),
       "edit_ids": torch.tensor(edit_ids, dtype=torch.long),
-      "src_tokens": src_tokens,
-      "dst_tokens": dst_tokens,
-      "copy_src_tokens": copy_src_tokens,
       "label": torch.tensor(label, dtype=torch.float),
       "is_long": is_long,
       "is_nciu": is_nciu,
@@ -222,9 +215,6 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     "dst_descs": [b["dst_desc"] for b in batch],
     "src_methods": [b["src_method"] for b in batch],
     "dst_methods": [b["dst_method"] for b in batch],
-    "src_tokens_list": [b["src_tokens"] for b in batch],
-    "dst_tokens_list": [b["dst_tokens"] for b in batch],
-    "copy_src_tokens_list": [b["copy_src_tokens"] for b in batch],
     "is_long": torch.tensor([b["is_long"] for b in batch], dtype=torch.bool),
     "is_nciu": torch.tensor([b["is_nciu"] for b in batch], dtype=torch.bool),
     "graphs": [b.get("graph") for b in batch],
@@ -300,7 +290,7 @@ def prepare_datasets(
   valid_ratio: float = 0.1,
   seed: int = 42,
   vocab_max_size: int = 30000,
-) -> Tuple[CUPDataset, CUPDataset, CUPDataset, Vocabulary]:
+) -> Tuple[CUPDataset, CUPDataset, CUPDataset, SubwordTokenizer]:
   os.makedirs(processed_dir, exist_ok=True)
   cleaner = CommentCleaner()
 
@@ -333,10 +323,16 @@ def prepare_datasets(
   rng.shuffle(valid_s)
   rng.shuffle(test_s)
 
-  # Build a CLOSED vocabulary from training comments (NOT the 100k mix_vocab).
-  # This keeps the output softmax trainable; the copy head covers rare OOV tokens.
-  vocab = build_vocabulary(train_s, max_size=vocab_max_size)
-  vocab.save(os.path.join(processed_dir, "vocab.json"))
+  # Train a byte-level BPE tokenizer on the TRAINING text (comments + edits).
+  # Subwords eliminate OOV (the exact-match ceiling) and shorten sequences.
+  def _corpus():
+    for s in train_s:
+      yield s.get("src_desc", "") or ""
+      yield s.get("dst_desc", "") or ""
+      yield build_edit_text(s)
+
+  tok_path = os.path.join(processed_dir, "tokenizer.json")
+  tokenizer = SubwordTokenizer.train(_corpus(), vocab_size=vocab_max_size, save_path=tok_path)
 
   stats = {
     "total": len(all_samples),
@@ -346,7 +342,7 @@ def prepare_datasets(
     "positive": sum(1 for s in all_samples if s.get("label")),
     "negative": sum(1 for s in all_samples if not s.get("label")),
     "nciu": sum(1 for s in all_samples if s.get("is_nciu")),
-    "vocab_size": len(vocab),
+    "vocab_size": len(tokenizer),
   }
   with open(os.path.join(processed_dir, "stats.json"), "w") as f:
     json.dump(stats, f, indent=2)
@@ -357,8 +353,8 @@ def prepare_datasets(
         f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
   return (
-    CUPDataset(train_s, vocab),
-    CUPDataset(valid_s, vocab),
-    CUPDataset(test_s, vocab),
-    vocab,
+    CUPDataset(train_s, tokenizer),
+    CUPDataset(valid_s, tokenizer),
+    CUPDataset(test_s, tokenizer),
+    tokenizer,
   )
