@@ -33,7 +33,7 @@ model:
 training:
   batch_size: 16
   detection_epochs: 15         # (unused by current single-phase train.py)
-  update_epochs: 25            # edit-learning (diff-aware loss) needs more epochs
+  update_epochs: 15            # edit-learning (diff-aware loss); capped at 15
   max_valid_batches: 30        # cap validation generation cost per epoch
   learning_rate: 3.0e-4        # for non-BERT params (OneCycle peak)
   graphcodebert_lr: 2.0e-5     # low LR for the pretrained encoder
