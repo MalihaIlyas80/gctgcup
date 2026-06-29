@@ -47,6 +47,7 @@ class Trainer:
     self.grad_accumulation_steps = grad_accumulation_steps
     os.makedirs(checkpoint_dir, exist_ok=True)
     self.best_val_loss = float("inf")
+    self.best_val_score = float("-inf")   # update-quality score (higher = better)
     self.epochs_no_improve = 0
     self.scheduler = None
     self.use_amp = device.type == "cuda"
@@ -112,6 +113,8 @@ class Trainer:
 
       # Greedy decode (beam=1) during training validation for speed;
       # full beam search is used only in the final scripts/evaluate.py run.
+      # force_update=True -> measure pure update quality on every sample;
+      # update metrics are restricted to the outdated subset below.
       gen_ids, no_upd_texts, beam_cands = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
@@ -121,6 +124,7 @@ class Trainer:
         comments=batch["src_descs"],
         src_descs=src_tok_texts,
         return_beam_candidates=True,
+        force_update=True,
       )
 
       for ids, no_upd, cands, ref, src in zip(
@@ -149,6 +153,7 @@ class Trainer:
       beam_candidates=beam_candidates_all,
       det_preds=det_preds, det_labels=det_labels,
       is_nciu=is_nciu_list, is_long=is_long_list,
+      outdated=det_labels,   # update metrics on the outdated-only subset
     )
     metrics.per_sample = {"val_loss": total_loss / max(n, 1)}
     return metrics
@@ -185,24 +190,33 @@ class Trainer:
       val_loss = metrics.per_sample["val_loss"]
       elapsed = time.time() - t0
 
+      # Select the checkpoint on UPDATE quality (outdated-only), not val_loss.
+      # val_loss is minimised by copying the old comment, so it rewards the
+      # exact failure mode we are fixing. Exact-match accuracy is the headline
+      # metric we must beat TG-CUP on; SARI gives a smooth early signal.
+      val_score = metrics.accuracy + 0.5 * metrics.sari
+
       print(
         f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-        f"Acc={metrics.accuracy:.2f}% | Det-F1={metrics.det_f1:.2f}% | "
-        f"SARI={metrics.sari:.2f}% | time={elapsed:.1f}s"
+        f"Acc={metrics.accuracy:.2f}% | SARI={metrics.sari:.2f}% | BLEU={metrics.bleu:.2f}% | "
+        f"Det-F1={metrics.det_f1:.2f}% | score={val_score:.2f} | time={elapsed:.1f}s"
       )
       history.append({"epoch": epoch, "train_loss": train_loss, **metrics.to_dict()})
 
-      if val_loss < self.best_val_loss:
+      if val_score > self.best_val_score:
+        self.best_val_score = val_score
         self.best_val_loss = val_loss
         self.epochs_no_improve = 0
         self.save_checkpoint("best.pt")
+        print(f"  ✓ new best (score={val_score:.2f}) -> saved best.pt")
       else:
         self.epochs_no_improve += 1
         if self.epochs_no_improve >= self.patience:
           print(f"Early stopping at epoch {epoch}")
           break
 
-    return {"history": history, "best_val_loss": self.best_val_loss}
+    return {"history": history, "best_val_loss": self.best_val_loss,
+            "best_val_score": self.best_val_score}
 
   def save_checkpoint(self, name: str) -> None:
     path = os.path.join(self.checkpoint_dir, name)

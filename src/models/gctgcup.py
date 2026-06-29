@@ -235,6 +235,40 @@ class GCTGCUP(nn.Module):
     # Pointer-generator: copy over the (old comment + edit) source sequence
     return self._mixture_logprobs(decoded, seq_enc, seq_mask, seq_ids)
 
+  def _diff_aware_nll(
+    self,
+    logprobs: torch.Tensor,
+    targets: torch.Tensor,
+    src_ids: torch.Tensor,
+    edit_weight: float = 3.0,
+  ) -> torch.Tensor:
+    """NLL that UP-WEIGHTS target tokens absent from the old comment.
+
+    For outdated samples the new comment ≈ old comment + a few edits, so plain
+    NLL is minimised by copying the old comment (high BLEU, ~0 exact match).
+    By weighting the *edited* tokens (those not present in the old comment) we
+    force the model to actually learn the edit instead of collapsing to copy.
+    """
+    B, T, V = logprobs.shape
+    nll = F.nll_loss(
+      logprobs.reshape(-1, V), targets.reshape(-1),
+      ignore_index=self.pad_id, reduction="none",
+    ).view(B, T)
+
+    in_src = torch.zeros(B, V, dtype=torch.bool, device=targets.device)
+    in_src.scatter_(1, src_ids.clamp(min=0), True)
+    tgt_in_src = in_src.gather(1, targets.clamp(min=0))            # (B, T)
+
+    weights = torch.where(
+      tgt_in_src,
+      torch.ones_like(targets, dtype=logprobs.dtype),
+      torch.full_like(targets, edit_weight, dtype=logprobs.dtype),
+    )
+    weights = weights.masked_fill(targets.eq(self.pad_id), 0.0)
+
+    nll = nll * weights
+    return nll.sum() / weights.sum().clamp(min=1.0)
+
   def forward(
     self,
     batch: Dict,
@@ -268,11 +302,10 @@ class GCTGCUP(nn.Module):
         [batch["graphs"][i] for i in idx.tolist()],
       )
       targets = batch["dst_ids"][idx, 1:]
-      # NLL over the pointer-generator mixture distribution
-      upd_loss = F.nll_loss(
-        upd_logprobs.reshape(-1, self.vocab_size),
-        targets.reshape(-1),
-        ignore_index=self.pad_id,
+      # Diff-aware NLL: up-weight edited tokens so the model learns to EDIT,
+      # not just copy the old comment (the cause of ~0 exact-match accuracy).
+      upd_loss = self._diff_aware_nll(
+        upd_logprobs, targets, batch["src_ids"][idx],
       )
       result["upd_loss"] = upd_loss
     else:
@@ -348,9 +381,6 @@ class GCTGCUP(nn.Module):
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask_i, seq_mask, graph_mask], dim=1)
 
-      src_len = int(src_ids[i].ne(self.pad_id).sum().item())
-      min_len = max(2, src_len // 3)
-
       # ── Length-normalized beam search over the copy-mixture distribution ──
       beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
       completed: List[tuple] = []
@@ -372,12 +402,15 @@ class GCTGCUP(nn.Module):
           )
           log_probs = self._mixture_logprobs(dec[:, -1:], seq_enc, seq_mask, seq_ids)[0, -1]
 
-          # Light penalty against repeating the immediately previous token
-          prev = seq[0, -1].item()
-          if prev not in (self.sos_id, self.eos_id, self.pad_id):
-            log_probs[prev] -= 0.6
+          # Block only degenerate loops (same token 3x in a row); do NOT force
+          # length from the old comment, which used to wreck exact match.
+          if seq.size(1) >= 2:
+            last, last2 = seq[0, -1].item(), seq[0, -2].item()
+            if last == last2 and last not in (self.sos_id, self.eos_id, self.pad_id):
+              log_probs[last] -= 1e9
 
-          if seq.size(1) <= min_len:
+          # Require at least one real token before EOS.
+          if seq.size(1) == 1:
             log_probs[self.eos_id] -= 1e9
 
           seq_len = seq.size(1)
