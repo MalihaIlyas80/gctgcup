@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.data.dataset import CUPDataset, collate_fn
-from src.data.tokenizer import SubwordTokenizer
 from src.evaluation.metrics import compute_all_metrics
 from src.models.gctgcup import GCTGCUP
 
@@ -26,15 +25,17 @@ def load_jsonl(path):
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, tokenizer, device, det_threshold=0.5, beam_size=5):
+def evaluate_model(model, loader, device, det_threshold=0.5, beam_size=5, max_len=64,
+                   qualitative=None, max_batches=None):
   model.eval()
-  decode_fn = tokenizer.decode
   predictions, references, sources = [], [], []
   det_preds, det_labels = [], []
   is_nciu, is_long, outdated = [], [], []
   beam_cands = []
 
-  for batch in loader:
+  for bi, batch in enumerate(loader):
+    if max_batches is not None and bi >= max_batches:
+      break
     for k, v in batch.items():
       if isinstance(v, torch.Tensor):
         batch[k] = v.to(device)
@@ -45,27 +46,31 @@ def evaluate_model(model, loader, tokenizer, device, det_threshold=0.5, beam_siz
     labels = batch["labels"].long().cpu().tolist()
     det_labels.extend(labels)
 
-    # Detokenized src/ref (same text space as predictions) for fair exact-match.
-    src_texts = [decode_fn(ids.tolist()) for ids in batch["src_ids"]]
-    ref_texts = [decode_fn(ids.tolist()) for ids in batch["dst_ids"]]
+    # Source = old comment, reference = new comment (raw text).
+    src_texts = batch["src_descs"]
+    ref_texts = batch["dst_descs"]
 
     # force_update=True -> always generate (TG-CUP-style pure update quality).
     pred_texts, beam_b = model.generate(
-      batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
-      batch["graphs"],
-      max_len=50, beam_size=beam_size,
+      batch["src_descs"], batch["edit_texts"], batch["ast_texts"],
+      max_len=max_len, beam_size=beam_size,
       det_threshold=det_threshold,
-      comments=batch["src_descs"],
-      src_descs=src_texts,
-      decode_fn=decode_fn,
       force_update=True,
     )
-    for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_texts, src_texts):
+    for pred_text, cands, ref, src, lab in zip(pred_texts, beam_b, ref_texts, src_texts, labels):
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
       beam_cands.append(cands)
+      # Collect qualitative examples on OUTDATED samples (the update task).
+      if qualitative is not None and lab == 1 and len(qualitative) < 20:
+        qualitative.append({
+          "OLD (source)": src,
+          "PRED (model)": pred_text,
+          "NEW (reference)": ref,
+          "exact_match": pred_text.strip() == ref.strip(),
+        })
 
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())
@@ -126,28 +131,29 @@ def main():
   parser.add_argument("--config", default="configs/default.yaml")
   parser.add_argument("--processed-dir", default="data/processed")
   parser.add_argument("--checkpoint", default="checkpoints/best.pt")
+  parser.add_argument("--beam-size", type=int, default=None,
+                      help="Override beam size (use 1 for a fast diagnostic)")
+  parser.add_argument("--max-batches", type=int, default=None,
+                      help="Only evaluate the first N batches (fast diagnostic)")
   args = parser.parse_args()
 
   with open(args.config) as f:
     cfg = yaml.safe_load(f)
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  tokenizer = SubwordTokenizer.load(os.path.join(args.processed_dir, "tokenizer.json"))
-  test_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "test.jsonl")), tokenizer,
+  test_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "test.jsonl")),
                        long_threshold=cfg["data"]["long_comment_threshold"])
   test_loader = DataLoader(test_ds, batch_size=cfg["training"]["batch_size"],
                            shuffle=False, collate_fn=collate_fn)
 
   model = GCTGCUP(
-    vocab_size=len(tokenizer),
     hidden_dim=cfg["model"]["hidden_dim"],
-    num_heads=cfg["model"]["num_heads"],
-    num_encoder_layers=cfg["model"]["num_encoder_layers"],
-    num_decoder_layers=cfg["model"]["num_decoder_layers"],
-    ggnn_steps=cfg["model"]["ggnn_steps"],
     dropout=cfg["model"]["dropout"],
     graphcodebert_name=cfg["model"]["graphcodebert"],
     long_threshold=cfg["data"]["long_comment_threshold"],
+    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-small"),
+    max_src_len=cfg["model"].get("max_src_len", 320),
+    max_tgt_len=cfg["model"].get("max_tgt_len", 64),
   ).to(device)
 
   if os.path.exists(args.checkpoint):
@@ -157,11 +163,31 @@ def main():
   else:
     print("WARNING: No checkpoint found – evaluating untrained model.")
 
+  qualitative = []
+  beam_size = args.beam_size or cfg["model"].get("beam_size", 5)
   metrics = evaluate_model(
-    model, test_loader, tokenizer, device,
+    model, test_loader, device,
     det_threshold=cfg["model"].get("det_threshold", 0.5),
-    beam_size=cfg["model"].get("beam_size", 5),
+    beam_size=beam_size,
+    max_len=cfg["model"].get("max_tgt_len", 64),
+    qualitative=qualitative,
+    max_batches=args.max_batches,
   )
+
+  # ── Qualitative diagnostic: are predictions in the SAME text space as refs? ──
+  print("\n" + "=" * 70)
+  print(" QUALITATIVE SAMPLES (outdated subset)  —  OLD -> PRED vs NEW")
+  print("=" * 70)
+  for i, ex in enumerate(qualitative):
+    print(f"\n[{i}] exact_match={ex['exact_match']}")
+    print(f"  OLD : {ex['OLD (source)']!r}")
+    print(f"  PRED: {ex['PRED (model)']!r}")
+    print(f"  NEW : {ex['NEW (reference)']!r}")
+  qpath = os.path.join(cfg["training"]["checkpoint_dir"], "qualitative_samples.json")
+  with open(qpath, "w", encoding="utf-8") as f:
+    json.dump(qualitative, f, ensure_ascii=False, indent=2)
+  print(f"\n(saved {len(qualitative)} examples to {qpath})")
+
   print_comparison(metrics, cfg["evaluation"]["tgcup_baseline"])
 
   report = metrics.to_dict()

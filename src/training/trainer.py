@@ -40,7 +40,6 @@ class Trainer:
     self.checkpoint_dir = checkpoint_dir
     self.patience = patience
     self.tokenizer = tokenizer
-    self.decode_fn = tokenizer.decode if tokenizer is not None else (lambda ids: " ".join(map(str, ids)))
     self.max_valid_batches = max_valid_batches
     self.det_threshold = det_threshold
     # move pos_weight to device
@@ -108,23 +107,19 @@ class Trainer:
       det_preds.extend(preds)
       det_labels.extend(labels)
 
-      # Detokenized src/ref (same space as predictions) for fair exact-match.
-      src_texts = [self.decode_fn(ids.tolist()) for ids in batch["src_ids"]]
-      ref_texts = [self.decode_fn(ids.tolist()) for ids in batch["dst_ids"]]
+      # Source = old comment, reference = new comment (raw text).
+      src_texts = batch["src_descs"]
+      ref_texts = batch["dst_descs"]
 
       # Greedy decode (beam=1) during training validation for speed;
       # full beam search is used only in the final scripts/evaluate.py run.
       # force_update=True -> measure pure update quality on every sample;
       # update metrics are restricted to the outdated subset below.
       pred_texts, beam_b = self.model.generate(
-        batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
-        batch["graphs"],
+        batch["src_descs"], batch["edit_texts"], batch["ast_texts"],
         beam_size=1,
         det_threshold=self.det_threshold,
-        comments=batch["src_descs"],
-        src_descs=src_texts,
-        decode_fn=self.decode_fn,
         force_update=True,
       )
 

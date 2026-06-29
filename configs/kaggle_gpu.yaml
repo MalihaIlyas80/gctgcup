@@ -18,28 +18,34 @@ data:
   vocab_max_size: 16000        # byte-level BPE vocab size (no OOV)
 
 model:
-  hidden_dim: 256              # full TG-CUP-scale hidden size
+  hidden_dim: 256              # detector fusion size
   num_heads: 8
   num_encoder_layers: 4
   num_decoder_layers: 4
-  ggnn_steps: 6                # TG-CUP uses 6 GGNN propagation steps
+  ggnn_steps: 6                # (legacy; AST-diff now fed to CodeT5 as text)
   dropout: 0.2
   graphcodebert: "microsoft/graphcodebert-base"
   freeze_graphcodebert: false  # MANDATORY: fine-tune GraphCodeBERT on GPU
+  # Stage-2 update generator: a PRETRAINED code-aware seq2seq (data-efficient,
+  # this is what beats TG-CUP on a small dataset).
+  update_model: "Salesforce/codet5-small"
+  max_src_len: 320             # old comment + code edit + AST diff
+  max_tgt_len: 64              # generated comment length
   beam_size: 5
-  max_decode_len: 50
+  max_decode_len: 64
   det_threshold: 0.5
 
 training:
-  batch_size: 16
+  batch_size: 8                # two transformers in memory -> smaller batch
   detection_epochs: 15         # (unused by current single-phase train.py)
-  update_epochs: 15            # edit-learning (diff-aware loss); capped at 15
+  update_epochs: 15
   max_valid_batches: 30        # cap validation generation cost per epoch
-  learning_rate: 3.0e-4        # for non-BERT params (OneCycle peak)
+  learning_rate: 3.0e-4        # detector head / projections (OneCycle peak)
   graphcodebert_lr: 2.0e-5     # low LR for the pretrained encoder
+  update_lr: 5.0e-5            # low LR for fine-tuning pretrained CodeT5
   weight_decay: 0.01
-  patience: 6                  # best chosen on update score (acc+SARI), give it room
-  grad_accumulation_steps: 2   # effective batch = 16 x 2 = 32
+  patience: 6                  # best chosen on update score (acc+SARI)
+  grad_accumulation_steps: 4   # effective batch = 8 x 4 = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
   pos_weight: 2.0              # neg/pos ≈ 65/35 from balanced sampling

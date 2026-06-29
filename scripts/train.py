@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.data.dataset import CUPDataset, collate_fn
-from src.data.tokenizer import SubwordTokenizer
 from src.models.gctgcup import GCTGCUP
 from src.training.trainer import Trainer
 
@@ -26,19 +25,24 @@ def load_jsonl(path):
 
 
 def build_optimizer(model, cfg):
-  """Separate LR for GraphCodeBERT (pretrained) vs rest of model."""
-  bert_params, other_params = [], []
+  """Separate LRs for GraphCodeBERT, CodeT5 updater, and the rest."""
+  bert_params, t5_params, other_params = [], [], []
   for name, p in model.named_parameters():
     if not p.requires_grad:
       continue
-    if "bert" in name or "code_encoder" in name:
+    if "updater" in name:
+      t5_params.append(p)
+    elif "code_encoder" in name or "comment_encoder" in name or "bert" in name:
       bert_params.append(p)
     else:
       other_params.append(p)
-  return torch.optim.AdamW([
+  groups = [
     {"params": other_params, "lr": cfg["training"]["learning_rate"]},
     {"params": bert_params,  "lr": cfg["training"].get("graphcodebert_lr", 1e-5)},
-  ], weight_decay=cfg["training"]["weight_decay"])
+  ]
+  if t5_params:
+    groups.append({"params": t5_params, "lr": cfg["training"].get("update_lr", 5e-5)})
+  return torch.optim.AdamW(groups, weight_decay=cfg["training"]["weight_decay"])
 
 
 def main():
@@ -59,10 +63,9 @@ def main():
     torch.set_num_interop_threads(max(1, n_threads // 2))
     print(f"CPU threads: {n_threads} intra / {max(1, n_threads // 2)} inter")
 
-  tokenizer = SubwordTokenizer.load(os.path.join(args.processed_dir, "tokenizer.json"))
-  train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")), tokenizer,
+  train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")),
                         long_threshold=cfg["data"]["long_comment_threshold"])
-  valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")), tokenizer,
+  valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")),
                         long_threshold=cfg["data"]["long_comment_threshold"])
 
   num_workers = min(4, (os.cpu_count() or 1) // 2)
@@ -74,16 +77,14 @@ def main():
                             persistent_workers=num_workers > 0)
 
   model = GCTGCUP(
-    vocab_size=len(tokenizer),
     hidden_dim=cfg["model"]["hidden_dim"],
-    num_heads=cfg["model"]["num_heads"],
-    num_encoder_layers=cfg["model"]["num_encoder_layers"],
-    num_decoder_layers=cfg["model"]["num_decoder_layers"],
-    ggnn_steps=cfg["model"]["ggnn_steps"],
     dropout=cfg["model"]["dropout"],
     graphcodebert_name=cfg["model"]["graphcodebert"],
     freeze_bert=cfg["model"]["freeze_graphcodebert"],
     long_threshold=cfg["data"]["long_comment_threshold"],
+    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-small"),
+    max_src_len=cfg["model"].get("max_src_len", 320),
+    max_tgt_len=cfg["model"].get("max_tgt_len", 64),
   )
 
   optimizer = build_optimizer(model, cfg)
@@ -98,7 +99,6 @@ def main():
     model, train_loader, valid_loader, optimizer, device,
     checkpoint_dir=cfg["training"]["checkpoint_dir"],
     patience=cfg["training"]["patience"],
-    tokenizer=tokenizer,
     max_valid_batches=cfg["training"].get("max_valid_batches", 10),
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),

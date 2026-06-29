@@ -1,5 +1,6 @@
 torch>=2.0.0
 transformers>=4.36.0
+sentencepiece>=0.1.99
 torch-geometric>=2.4.0
 javalang>=0.13.0
 numpy>=1.24.0

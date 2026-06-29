@@ -1,19 +1,25 @@
 """
-Dataset loading, vocabulary, and collation for GC-TGCUP.
+Dataset loading and collation for GC-TGCUP.
+
+The model is fully text-conditioned:
+  * Stage 1 detection uses GraphCodeBERT on raw code/comment text.
+  * Stage 2 update is a pretrained CodeT5 fed with
+        old comment + code-edit sequence + AST-diff summary.
+So there is no closed vocabulary / id tensors here — we precompute the
+edit-sequence text and AST-diff summary once at prepare time and store them in
+the processed jsonl, keeping per-epoch data loading cheap (no javalang at train).
 """
 from __future__ import annotations
 
 import json
 import os
 import random
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
-from .ast_diff import ASTDiffGraph, build_ast_diff_graph
+from .ast_diff import build_ast_diff_graph
 from .cleaning import (
     CommentCleaner,
     build_edit_sequence,
@@ -21,7 +27,9 @@ from .cleaning import (
     flatten_edit_sequence,
     is_valid_sample,
 )
-from .tokenizer import SubwordTokenizer
+
+# AST-diff edge type for "node value updated old->new" (see ast_diff.EDGE_UPDATE).
+_EDGE_UPDATE = 2
 
 
 def build_edit_text(s: Dict[str, Any]) -> str:
@@ -29,197 +37,104 @@ def build_edit_text(s: Dict[str, Any]) -> str:
   old_t, new_t, acts = build_edit_sequence(s.get("code_change_seq", []))
   return " ".join(flatten_edit_sequence(old_t, new_t, acts))
 
-SPECIAL_TOKENS = [
-    "<pad>", "<s>", "</s>", "<unk>", "<sep>",
-    "<before>", "<after>", "<equal>", "<replace>", "<insert>", "<delete>",
-    "<keep>", "<copy>", "<local_edit>",
-]
 
+def build_ast_text(old_code: str, new_code: str, max_items: int = 30) -> str:
+  """Serialise the AST-difference graph into a compact text summary.
 
-class Vocabulary:
-  def __init__(self):
-    self.token2id: Dict[str, int] = {t: i for i, t in enumerate(SPECIAL_TOKENS)}
-    self.id2token = {i: t for t, i in self.token2id.items()}
-
-  def __len__(self) -> int:
-    return len(self.token2id)
-
-  def add_token(self, token: str) -> int:
-    if token not in self.token2id:
-      idx = len(self.token2id)
-      self.token2id[token] = idx
-      self.id2token[idx] = token
-    return self.token2id[token]
-
-  def encode(self, tokens: List[str], add_special: bool = True) -> List[int]:
-    ids = []
-    if add_special:
-      ids.append(self.token2id["<s>"])
-    for t in tokens:
-      ids.append(self.token2id.get(t, self.token2id["<unk>"]))
-    if add_special:
-      ids.append(self.token2id["</s>"])
-    return ids
-
-  def decode(self, ids: List[int], skip_special: bool = True) -> List[str]:
-    special = {self.token2id["<pad>"], self.token2id["<s>"], self.token2id["</s>"]}
-    tokens = []
-    for i in ids:
-      if skip_special and i in special:
-        continue
-      tokens.append(self.id2token.get(i, "<unk>"))
-    return tokens
-
-  def save(self, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-      json.dump(self.token2id, f, ensure_ascii=False, indent=2)
-
-  @classmethod
-  def load(cls, path: str) -> "Vocabulary":
-    vocab = cls()
-    with open(path, encoding="utf-8") as f:
-      data = json.load(f)
-    for tok, idx in data.items():
-      vocab.token2id[tok] = idx
-      vocab.id2token[idx] = tok
-    return vocab
-
-  @classmethod
-  def from_mix_vocab(cls, path: str) -> "Vocabulary":
-    """Load from cup2_dataset/mix_vocab.json token_word2id."""
-    vocab = cls()
-    with open(path, encoding="utf-8") as f:
-      data = json.load(f)
-    for tok, idx in data.get("token_word2id", {}).items():
-      vocab.token2id[tok] = idx
-      vocab.id2token[idx] = tok
-    return vocab
-
-
-def tokenize_comment(text: str) -> List[str]:
-    """Simple whitespace + punctuation tokenizer."""
-    import re
-    return [t for t in re.findall(r"\w+|<con>|[^\w\s]", text) if t.strip()]
-
-
-def _sample_comment_tokens(s: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-  """Tokens actually fed to the model (mirror CUPDataset.__getitem__)."""
-  src_tokens = s.get("src_desc_tokens") or tokenize_comment(s.get("src_desc", ""))
-  dst_tokens = s.get("dst_desc_tokens") or tokenize_comment(s.get("dst_desc", ""))
-  return src_tokens, dst_tokens
-
-
-def build_vocabulary(train_samples: List[Dict[str, Any]], max_size: int = 30000) -> "Vocabulary":
+  Captures TG-CUP's structural signal as text so it can condition the CodeT5
+  updater: updated nodes (old -> new value) and changed/inserted value nodes.
   """
-  Build a CLOSED vocabulary from the training comments only.
+  try:
+    graph = build_ast_diff_graph(old_code, new_code)
+  except Exception:
+    graph = None
+  if graph is None:
+    return ""
 
-  This is the single most important fix vs the old 100k mix_vocab: with a few
-  thousand training samples, a 100k-token output softmax never trains, which
-  collapses BLEU/GLEU/METEOR. A data-driven vocab (~8-15k) keeps the output
-  layer fully trainable, and the pointer-generator copy head handles any rare
-  out-of-vocabulary identifiers at inference time.
-  """
-  from collections import Counter
+  id2node = {n.node_id: n for n in graph.nodes}
+  parts: List[str] = []
+  seen = set()
 
-  counter: Counter = Counter()
-  for s in train_samples:
-    src_tokens, dst_tokens = _sample_comment_tokens(s)
-    counter.update(src_tokens)
-    counter.update(dst_tokens)
+  for src, dst, et in graph.edges:
+    if et == _EDGE_UPDATE:
+      o, n = id2node.get(src), id2node.get(dst)
+      if o is not None and n is not None:
+        frag = f"{o.node_type} {o.value} -> {n.value}".strip()
+        if frag not in seen:
+          seen.add(frag)
+          parts.append(frag)
 
-  vocab = Vocabulary()  # special tokens occupy ids 0..len(SPECIAL_TOKENS)-1
-  for tok, _freq in counter.most_common():
-    if len(vocab) >= max_size:
+  for n in graph.nodes:
+    if len(parts) >= max_items:
       break
-    vocab.add_token(tok)
-  return vocab
+    if n.is_value_node and n.value:
+      frag = f"{n.node_type} {n.value}".strip()
+      if frag not in seen:
+        seen.add(frag)
+        parts.append(frag)
+
+  return " ; ".join(parts[:max_items])
 
 
 class CUPDataset(Dataset):
-  """Single split of comment-update data."""
+  """Single split of comment-update data (text-only items)."""
 
   def __init__(
     self,
     samples: List[Dict[str, Any]],
-    tokenizer: "SubwordTokenizer",
     max_comment_len: int = 128,
-    max_edit_len: int = 512,
     long_threshold: int = 25,
-    build_graphs: bool = True,
+    **_ignored,
   ):
     self.samples = samples
-    self.tokenizer = tokenizer
     self.max_comment_len = max_comment_len
-    self.max_edit_len = max_edit_len
     self.long_threshold = long_threshold
-    self.build_graphs = build_graphs
 
   def __len__(self) -> int:
     return len(self.samples)
 
   def __getitem__(self, idx: int) -> Dict[str, Any]:
     s = self.samples[idx]
-    tok = self.tokenizer
     src_text = s.get("src_desc", "") or ""
     dst_text = s.get("dst_desc", "") or ""
-    edit_text = build_edit_text(s)
-
-    # Byte-level BPE: no OOV, loss-less encode<->decode.
-    src_ids = tok.encode_with_special(src_text, self.max_comment_len)
-    dst_ids = tok.encode_with_special(dst_text, self.max_comment_len)
-    edit_ids = tok.encode_with_special(edit_text, self.max_edit_len)
+    # Prefer precomputed fields (written by prepare_datasets); fall back live.
+    edit_text = s.get("edit_text")
+    if edit_text is None:
+      edit_text = build_edit_text(s)
+    ast_text = s.get("ast_text")
+    if ast_text is None:
+      ast_text = build_ast_text(s.get("src_method", ""), s.get("dst_method", ""))
 
     label = int(bool(s.get("label", True)))
     is_long = len(src_text.split()) > self.long_threshold
     is_nciu = bool(s.get("is_nciu", False))
 
-    item: Dict[str, Any] = {
+    return {
       "idx": s.get("idx", idx),
       "src_desc": src_text,
       "dst_desc": dst_text,
-      "src_method": s["src_method"],
-      "dst_method": s["dst_method"],
-      "src_ids": torch.tensor(src_ids, dtype=torch.long),
-      "dst_ids": torch.tensor(dst_ids, dtype=torch.long),
-      "edit_ids": torch.tensor(edit_ids, dtype=torch.long),
+      "src_method": s.get("src_method", ""),
+      "dst_method": s.get("dst_method", ""),
+      "edit_text": edit_text,
+      "ast_text": ast_text,
       "label": torch.tensor(label, dtype=torch.float),
       "is_long": is_long,
       "is_nciu": is_nciu,
     }
 
-    if self.build_graphs:
-      graph = build_ast_diff_graph(s["src_method"], s["dst_method"])
-      if graph is None:
-        graph = ASTDiffGraph(
-          nodes=[__import__("src.data.ast_diff", fromlist=["ASTNode"]).ASTNode(0, "Method", "method", True)],
-          edges=[],
-          value_node_indices=[0],
-        )
-      item["graph"] = graph
-
-    return item
-
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-  pad_id = 0
-
-  def pad_1d(tensors, pad_value=0):
-    return pad_sequence(tensors, batch_first=True, padding_value=pad_value)
-
-  out = {
-    "src_ids": pad_1d([b["src_ids"] for b in batch], pad_id),
-    "dst_ids": pad_1d([b["dst_ids"] for b in batch], pad_id),
-    "edit_ids": pad_1d([b["edit_ids"] for b in batch], pad_id),
+  return {
     "labels": torch.stack([b["label"] for b in batch]),
     "src_descs": [b["src_desc"] for b in batch],
     "dst_descs": [b["dst_desc"] for b in batch],
     "src_methods": [b["src_method"] for b in batch],
     "dst_methods": [b["dst_method"] for b in batch],
+    "edit_texts": [b["edit_text"] for b in batch],
+    "ast_texts": [b["ast_text"] for b in batch],
     "is_long": torch.tensor([b["is_long"] for b in batch], dtype=torch.bool),
     "is_nciu": torch.tensor([b["is_nciu"] for b in batch], dtype=torch.bool),
-    "graphs": [b.get("graph") for b in batch],
   }
-  return out
 
 
 def _stream_jsonl(path: str, max_lines: Optional[int] = None):
@@ -282,6 +197,13 @@ def load_and_clean_split(
   return samples[:max_samples]
 
 
+def _precompute_fields(samples: List[Dict[str, Any]]) -> None:
+  """Add edit_text + ast_text to each sample in-place (one-time, at prepare)."""
+  for s in samples:
+    s["edit_text"] = build_edit_text(s)
+    s["ast_text"] = build_ast_text(s.get("src_method", ""), s.get("dst_method", ""))
+
+
 def prepare_datasets(
   raw_dir: str,
   processed_dir: str,
@@ -289,8 +211,9 @@ def prepare_datasets(
   train_ratio: float = 0.8,
   valid_ratio: float = 0.1,
   seed: int = 42,
-  vocab_max_size: int = 30000,
-) -> Tuple[CUPDataset, CUPDataset, CUPDataset, SubwordTokenizer]:
+  long_threshold: int = 25,
+  **_ignored,
+) -> Tuple[CUPDataset, CUPDataset, CUPDataset, Dict[str, Any]]:
   os.makedirs(processed_dir, exist_ok=True)
   cleaner = CommentCleaner()
 
@@ -323,16 +246,10 @@ def prepare_datasets(
   rng.shuffle(valid_s)
   rng.shuffle(test_s)
 
-  # Train a byte-level BPE tokenizer on the TRAINING text (comments + edits).
-  # Subwords eliminate OOV (the exact-match ceiling) and shorten sequences.
-  def _corpus():
-    for s in train_s:
-      yield s.get("src_desc", "") or ""
-      yield s.get("dst_desc", "") or ""
-      yield build_edit_text(s)
-
-  tok_path = os.path.join(processed_dir, "tokenizer.json")
-  tokenizer = SubwordTokenizer.train(_corpus(), vocab_size=vocab_max_size, save_path=tok_path)
+  # Precompute edit-sequence text + AST-diff summary so training never pays the
+  # javalang parse cost again (huge per-epoch speedup vs building graphs live).
+  for split in (train_s, valid_s, test_s):
+    _precompute_fields(split)
 
   stats = {
     "total": len(all_samples),
@@ -342,7 +259,6 @@ def prepare_datasets(
     "positive": sum(1 for s in all_samples if s.get("label")),
     "negative": sum(1 for s in all_samples if not s.get("label")),
     "nciu": sum(1 for s in all_samples if s.get("is_nciu")),
-    "vocab_size": len(tokenizer),
   }
   with open(os.path.join(processed_dir, "stats.json"), "w") as f:
     json.dump(stats, f, indent=2)
@@ -353,8 +269,8 @@ def prepare_datasets(
         f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
   return (
-    CUPDataset(train_s, tokenizer),
-    CUPDataset(valid_s, tokenizer),
-    CUPDataset(test_s, tokenizer),
-    tokenizer,
+    CUPDataset(train_s, long_threshold=long_threshold),
+    CUPDataset(valid_s, long_threshold=long_threshold),
+    CUPDataset(test_s, long_threshold=long_threshold),
+    stats,
   )

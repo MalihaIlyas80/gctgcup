@@ -25,8 +25,11 @@ model:
   dropout: 0.3
   graphcodebert: "microsoft/graphcodebert-base"
   freeze_graphcodebert: true   # freeze BERT: biggest single CPU speedup
+  update_model: "Salesforce/codet5-small"
+  max_src_len: 320
+  max_tgt_len: 64
   beam_size: 5
-  max_decode_len: 50
+  max_decode_len: 64
   det_threshold: 0.5           # detection decision threshold
 
 training:
@@ -36,6 +39,7 @@ training:
   max_valid_batches: 100
   learning_rate: 2.0e-4
   graphcodebert_lr: 1.0e-5
+  update_lr: 5.0e-5
   weight_decay: 0.05
   patience: 5
   grad_accumulation_steps: 4   # effective batch = 8x4 = 32
