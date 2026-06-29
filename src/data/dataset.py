@@ -163,6 +163,16 @@ class CUPDataset(Dataset):
     edit_ids = self.vocab.encode(edit_flat[: self.max_edit_len], add_special=False)
     edit_ids = [self.vocab.token2id["<s>"]] + edit_ids + [self.vocab.token2id["</s>"]]
 
+    # Surface tokens of the copy source (old comment + <sep> + edit sequence),
+    # aligned 1:1 with the ids built above. Used by the extended-vocabulary
+    # pointer-generator at inference to copy OOV identifiers verbatim instead of
+    # emitting <unk> (the cause of near-zero exact-match accuracy).
+    copy_src_tokens = (
+      ["<s>"] + src_tokens[: self.max_comment_len] + ["</s>"]
+      + ["<sep>"]
+      + ["<s>"] + edit_flat[: self.max_edit_len] + ["</s>"]
+    )
+
     label = int(bool(s.get("label", True)))
     is_long = len(src_tokens) > self.long_threshold
     is_nciu = bool(s.get("is_nciu", False))
@@ -178,6 +188,7 @@ class CUPDataset(Dataset):
       "edit_ids": torch.tensor(edit_ids, dtype=torch.long),
       "src_tokens": src_tokens,
       "dst_tokens": dst_tokens,
+      "copy_src_tokens": copy_src_tokens,
       "label": torch.tensor(label, dtype=torch.float),
       "is_long": is_long,
       "is_nciu": is_nciu,
@@ -213,6 +224,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     "dst_methods": [b["dst_method"] for b in batch],
     "src_tokens_list": [b["src_tokens"] for b in batch],
     "dst_tokens_list": [b["dst_tokens"] for b in batch],
+    "copy_src_tokens_list": [b["copy_src_tokens"] for b in batch],
     "is_long": torch.tensor([b["is_long"] for b in batch], dtype=torch.bool),
     "is_nciu": torch.tensor([b["is_nciu"] for b in batch], dtype=torch.bool),
     "graphs": [b.get("graph") for b in batch],

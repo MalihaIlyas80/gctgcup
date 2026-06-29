@@ -31,6 +31,8 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
   det_preds, det_labels = [], []
   is_nciu, is_long, outdated = [], [], []
   beam_cands = []
+  oov_ref_outdated = 0          # outdated refs containing >=1 OOV token
+  n_outdated_seen = 0
 
   for batch in loader:
     for k, v in batch.items():
@@ -40,16 +42,16 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
     det_logits = model.detect(batch["src_methods"], batch["dst_methods"], batch["src_descs"])
     preds = (torch.sigmoid(det_logits) >= det_threshold).long().cpu().tolist()
     det_preds.extend(preds)
-    det_labels.extend(batch["labels"].long().cpu().tolist())
+    labels = batch["labels"].long().cpu().tolist()
+    det_labels.extend(labels)
 
     # Token-space src/ref so generated predictions and references are comparable
     src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
     ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
     # force_update=True -> always generate (TG-CUP-style pure update quality).
-    # Update metrics are later restricted to the outdated-only subset so the
-    # comparison with TG-CUP is apples-to-apples.
-    gen_ids, no_upd_texts, beam_ids = model.generate(
+    # Extended-vocab pointer-generator decodes straight to surface strings.
+    pred_texts, beam_b = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
       batch["graphs"],
@@ -57,34 +59,39 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5)
       det_threshold=det_threshold,
       comments=batch["src_descs"],
       src_descs=src_tok_texts,
-      return_beam_candidates=True,
+      copy_src_tokens=batch["copy_src_tokens_list"],
+      id2token=vocab.id2token,
       force_update=True,
     )
-    for ids, no_upd, cands, ref, src in zip(
-      gen_ids, no_upd_texts, beam_ids, ref_tok_texts, src_tok_texts
-    ):
-      if no_upd is not None:
-        # No update predicted: use original comment directly (exact match preserved)
-        pred_text = no_upd
-        beam_cands.append([no_upd] * 5)
-      else:
-        pred_text = " ".join(vocab.decode(ids))
-        beam_cands.append([" ".join(vocab.decode(c)) for c in cands])
+    for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_tok_texts, src_tok_texts):
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
+      beam_cands.append(cands)
+
+    # OOV diagnostic on the outdated references (the exact-match ceiling)
+    for lab, toks in zip(labels, batch["dst_tokens_list"]):
+      if lab == 1:
+        n_outdated_seen += 1
+        if any(t not in vocab.token2id for t in toks):
+          oov_ref_outdated += 1
 
     is_nciu.extend(batch["is_nciu"].cpu().tolist())
     is_long.extend(batch["is_long"].cpu().tolist())
-    outdated.extend(batch["labels"].long().cpu().tolist())
+    outdated.extend(labels)
 
-  return compute_all_metrics(
+  metrics = compute_all_metrics(
     predictions, references, sources,
     beam_candidates=beam_cands,
     det_preds=det_preds, det_labels=det_labels,
     is_nciu=is_nciu, is_long=is_long,
     outdated=outdated,
   )
+  oov_pct = oov_ref_outdated / max(n_outdated_seen, 1) * 100
+  print(f"\n[diagnostic] outdated refs with >=1 OOV token: "
+        f"{oov_ref_outdated}/{n_outdated_seen} ({oov_pct:.1f}%) "
+        f"-> theoretical exact-match ceiling ~= {100 - oov_pct:.1f}%")
+  return metrics
 
 
 def print_comparison(metrics, baseline):

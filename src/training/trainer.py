@@ -115,7 +115,7 @@ class Trainer:
       # full beam search is used only in the final scripts/evaluate.py run.
       # force_update=True -> measure pure update quality on every sample;
       # update metrics are restricted to the outdated subset below.
-      gen_ids, no_upd_texts, beam_cands = self.model.generate(
+      pred_texts, beam_b = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"],
@@ -123,27 +123,16 @@ class Trainer:
         det_threshold=self.det_threshold,
         comments=batch["src_descs"],
         src_descs=src_tok_texts,
-        return_beam_candidates=True,
+        copy_src_tokens=batch["copy_src_tokens_list"],
+        id2token=self.vocab.id2token if self.vocab else None,
         force_update=True,
       )
 
-      for ids, no_upd, cands, ref, src in zip(
-        gen_ids, no_upd_texts, beam_cands, ref_tok_texts, src_tok_texts
-      ):
-        if no_upd is not None:
-          # No update predicted: return original comment directly (no tokenization loss)
-          pred_text = no_upd
-          beam_texts = [no_upd] * 5
-        else:
-          pred_text = " ".join(self.vocab.decode(ids)) if self.vocab else " ".join(str(t) for t in ids)
-          beam_texts = [
-            " ".join(self.vocab.decode(c)) if self.vocab else " ".join(str(t) for t in c)
-            for c in cands
-          ]
+      for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_tok_texts, src_tok_texts):
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)
-        beam_candidates_all.append(beam_texts)
+        beam_candidates_all.append(cands)
 
       is_nciu_list.extend(batch["is_nciu"].cpu().tolist())
       is_long_list.extend(batch["is_long"].cpu().tolist())
