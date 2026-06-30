@@ -150,10 +150,15 @@ def main():
     hidden_dim=cfg["model"]["hidden_dim"],
     dropout=cfg["model"]["dropout"],
     graphcodebert_name=cfg["model"]["graphcodebert"],
+    freeze_bert=cfg["model"].get("freeze_graphcodebert", True),
     long_threshold=cfg["data"]["long_comment_threshold"],
-    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-small"),
-    max_src_len=cfg["model"].get("max_src_len", 320),
-    max_tgt_len=cfg["model"].get("max_tgt_len", 64),
+    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-base"),
+    max_src_len=cfg["model"].get("max_src_len", 512),
+    max_tgt_len=cfg["model"].get("max_tgt_len", 128),
+    max_edit_chars=cfg["model"].get("max_edit_chars", 400),
+    max_ast_chars=cfg["model"].get("max_ast_chars", 200),
+    det_loss_weight=cfg["model"].get("det_loss_weight", 0.15),
+    upd_loss_weight=cfg["model"].get("upd_loss_weight", 0.85),
   ).to(device)
 
   if os.path.exists(args.checkpoint):
@@ -169,7 +174,7 @@ def main():
     model, test_loader, device,
     det_threshold=cfg["model"].get("det_threshold", 0.5),
     beam_size=beam_size,
-    max_len=cfg["model"].get("max_tgt_len", 64),
+    max_len=cfg["model"].get("max_decode_len", 128),
     qualitative=qualitative,
     max_batches=args.max_batches,
   )

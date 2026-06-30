@@ -1,11 +1,10 @@
-# GC-TGCUP — Kaggle GPU config (target: BEAT TG-CUP).
-# GraphCodeBERT is fine-tuned (mandatory), full-size model, larger data.
+# GC-TGCUP — Kaggle GPU config (target: BEAT TG-CUP on 20k data).
 project_name: "GC-TGCUP"
 
 data:
   raw_dir: "cup2_dataset"
   processed_dir: "data/processed"
-  max_samples: 20000           # raise for the final run (e.g. 40000+) if time allows
+  max_samples: 20000
   train_ratio: 0.8
   valid_ratio: 0.1
   test_ratio: 0.1
@@ -15,40 +14,37 @@ data:
   long_comment_threshold: 25
   min_comment_len: 3
   seed: 42
-  vocab_max_size: 16000        # byte-level BPE vocab size (no OOV)
 
 model:
-  hidden_dim: 256              # detector fusion size
-  num_heads: 8
-  num_encoder_layers: 4
-  num_decoder_layers: 4
-  ggnn_steps: 6                # (legacy; AST-diff now fed to CodeT5 as text)
+  hidden_dim: 256
   dropout: 0.2
   graphcodebert: "microsoft/graphcodebert-base"
-  freeze_graphcodebert: false  # MANDATORY: fine-tune GraphCodeBERT on GPU
-  # Stage-2 update generator: a PRETRAINED code-aware seq2seq (data-efficient,
-  # this is what beats TG-CUP on a small dataset).
-  update_model: "Salesforce/codet5-small"
-  max_src_len: 320             # old comment + code edit + AST diff
-  max_tgt_len: 64              # generated comment length
+  freeze_graphcodebert: true       # free GPU for larger CodeT5-base updater
+  # Larger pretrained updater — main lever to beat TG-CUP exact-match / BLEU.
+  update_model: "Salesforce/codet5-base"
+  max_src_len: 512
+  max_tgt_len: 128
+  max_edit_chars: 400
+  max_ast_chars: 200
+  det_loss_weight: 0.15            # focus training on UPDATE quality
+  upd_loss_weight: 0.85
   beam_size: 5
-  max_decode_len: 64
+  max_decode_len: 128
   det_threshold: 0.5
 
 training:
-  batch_size: 8                # two transformers in memory -> smaller batch
-  detection_epochs: 15         # (unused by current single-phase train.py)
-  update_epochs: 15
-  max_valid_batches: 30        # cap validation generation cost per epoch
-  learning_rate: 3.0e-4        # detector head / projections (OneCycle peak)
-  graphcodebert_lr: 2.0e-5     # low LR for the pretrained encoder
-  update_lr: 5.0e-5            # low LR for fine-tuning pretrained CodeT5
+  batch_size: 4                    # codet5-base + GraphCodeBERT on T4
+  update_epochs: 20
+  max_valid_batches: 15
+  learning_rate: 3.0e-4
+  graphcodebert_lr: 1.0e-5
+  update_lr: 2.0e-5
   weight_decay: 0.01
-  patience: 6                  # best chosen on update score (acc+SARI)
-  grad_accumulation_steps: 4   # effective batch = 8 x 4 = 32
+  patience: 8
+  grad_accumulation_steps: 8       # effective batch = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
-  pos_weight: 2.0              # neg/pos ≈ 65/35 from balanced sampling
+  pos_weight: 2.5
 
 evaluation:
   metrics: [accuracy, recall_at_5, gleu, meteor, sari, bleu]

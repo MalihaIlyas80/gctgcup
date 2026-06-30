@@ -10,18 +10,27 @@ import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 
+def normalize_eval_text(text: str) -> str:
+  """Same normalization for predictions and references (fair exact-match vs TG-CUP)."""
+  if not text:
+    return ""
+  text = text.replace("<con>", " ")
+  return " ".join(text.split()).strip()
+
+
 def _tokenize(text: str) -> List[str]:
-  return text.lower().split()
+  return normalize_eval_text(text).lower().split()
 
 
 def exact_match(pred: str, ref: str) -> bool:
-  return pred.strip() == ref.strip()
+  return normalize_eval_text(pred) == normalize_eval_text(ref)
 
 
 def recall_at_k(predictions: List[List[str]], references: List[str], k: int = 5) -> float:
   hits = 0
   for cands, ref in zip(predictions, references):
-    if any(c.strip() == ref.strip() for c in cands[:k]):
+    ref_n = normalize_eval_text(ref)
+    if any(normalize_eval_text(c) == ref_n for c in cands[:k]):
       hits += 1
   return hits / max(len(references), 1) * 100
 
@@ -176,9 +185,9 @@ def compute_all_metrics(
     upd_idx = list(range(len(references)))
   m.num_outdated = len(upd_idx)
 
-  upd_preds = [predictions[i] for i in upd_idx]
-  upd_refs = [references[i] for i in upd_idx]
-  upd_srcs = [sources[i] for i in upd_idx]
+  upd_preds = [normalize_eval_text(predictions[i]) for i in upd_idx]
+  upd_refs = [normalize_eval_text(references[i]) for i in upd_idx]
+  upd_srcs = [normalize_eval_text(sources[i]) for i in upd_idx]
 
   m.accuracy = sum(exact_match(p, r) for p, r in zip(upd_preds, upd_refs)) / max(len(upd_refs), 1) * 100
 

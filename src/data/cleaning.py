@@ -21,6 +21,17 @@ _MULTI_NL_RE = re.compile(r"\n{3,}")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _HTML_ENTITY_RE = re.compile(r"&[a-zA-Z]+;|&#\d+;")
 _BLANK_LINE_RE = re.compile(r"^\s*$", re.MULTILINE)
+# CUP2 stores word boundaries as <con>; normalize so CodeT5 + exact-match align.
+_CON_TOKEN_RE = re.compile(r"<con>")
+
+
+def normalize_comment_text(text: str) -> str:
+  """Normalize comment text for training and TG-CUP-fair evaluation."""
+  if not text:
+    return ""
+  text = _CON_TOKEN_RE.sub(" ", text)
+  text = _MULTI_SPACE_RE.sub(" ", text)
+  return text.strip()
 
 
 @dataclass
@@ -60,7 +71,7 @@ class CommentCleaner:
         if self.lowercase:
             text = text.lower()
 
-        return text.strip()
+        return normalize_comment_text(text)
 
 
 _DEFAULT_CLEANER = CommentCleaner()

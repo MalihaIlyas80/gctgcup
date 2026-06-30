@@ -82,9 +82,13 @@ def main():
     graphcodebert_name=cfg["model"]["graphcodebert"],
     freeze_bert=cfg["model"]["freeze_graphcodebert"],
     long_threshold=cfg["data"]["long_comment_threshold"],
-    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-small"),
-    max_src_len=cfg["model"].get("max_src_len", 320),
-    max_tgt_len=cfg["model"].get("max_tgt_len", 64),
+    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-base"),
+    max_src_len=cfg["model"].get("max_src_len", 512),
+    max_tgt_len=cfg["model"].get("max_tgt_len", 128),
+    max_edit_chars=cfg["model"].get("max_edit_chars", 400),
+    max_ast_chars=cfg["model"].get("max_ast_chars", 200),
+    det_loss_weight=cfg["model"].get("det_loss_weight", 0.15),
+    upd_loss_weight=cfg["model"].get("upd_loss_weight", 0.85),
   )
 
   optimizer = build_optimizer(model, cfg)
@@ -103,6 +107,7 @@ def main():
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),
     det_threshold=cfg["model"].get("det_threshold", 0.5),
+    max_decode_len=cfg["model"].get("max_decode_len", 128),
   )
 
   epochs = args.epochs or cfg["training"]["update_epochs"]

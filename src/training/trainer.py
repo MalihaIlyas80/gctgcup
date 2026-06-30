@@ -31,6 +31,7 @@ class Trainer:
     pos_weight: Optional[torch.Tensor] = None,
     grad_accumulation_steps: int = 4,
     det_threshold: float = 0.5,
+    max_decode_len: int = 128,
   ):
     self.model = model.to(device)
     self.train_loader = train_loader
@@ -42,6 +43,7 @@ class Trainer:
     self.tokenizer = tokenizer
     self.max_valid_batches = max_valid_batches
     self.det_threshold = det_threshold
+    self.max_decode_len = max_decode_len
     # move pos_weight to device
     self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
     self.grad_accumulation_steps = grad_accumulation_steps
@@ -121,6 +123,7 @@ class Trainer:
         beam_size=1,
         det_threshold=self.det_threshold,
         force_update=True,
+        max_len=self.max_decode_len,
       )
 
       for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_texts, src_texts):
@@ -174,11 +177,8 @@ class Trainer:
       val_loss = metrics.per_sample["val_loss"]
       elapsed = time.time() - t0
 
-      # Select the checkpoint on UPDATE quality (outdated-only), not val_loss.
-      # val_loss is minimised by copying the old comment, so it rewards the
-      # exact failure mode we are fixing. Exact-match accuracy is the headline
-      # metric we must beat TG-CUP on; SARI gives a smooth early signal.
-      val_score = metrics.accuracy + 0.5 * metrics.sari
+      # Checkpoint on multi-metric update quality (TG-CUP headline = accuracy + BLEU/SARI).
+      val_score = metrics.accuracy + 0.25 * metrics.sari + 0.15 * metrics.bleu
 
       print(
         f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "

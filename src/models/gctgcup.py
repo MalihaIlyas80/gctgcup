@@ -34,11 +34,13 @@ class GCTGCUP(nn.Module):
     graphcodebert_name: str = "microsoft/graphcodebert-base",
     freeze_bert: bool = False,
     long_threshold: int = 25,
-    update_model_name: str = "Salesforce/codet5-small",
-    max_src_len: int = 320,
-    max_tgt_len: int = 64,
-    det_loss_weight: float = 0.3,
-    upd_loss_weight: float = 0.7,
+    update_model_name: str = "Salesforce/codet5-base",
+    max_src_len: int = 512,
+    max_tgt_len: int = 128,
+    max_edit_chars: int = 400,
+    max_ast_chars: int = 200,
+    det_loss_weight: float = 0.15,
+    upd_loss_weight: float = 0.85,
     **_ignored,
   ):
     super().__init__()
@@ -60,6 +62,8 @@ class GCTGCUP(nn.Module):
       model_name=update_model_name,
       max_src_len=max_src_len,
       max_tgt_len=max_tgt_len,
+      max_edit_chars=max_edit_chars,
+      max_ast_chars=max_ast_chars,
     )
 
   # ── Stage 1 ──────────────────────────────────────────────────────────
@@ -120,7 +124,7 @@ class GCTGCUP(nn.Module):
     beam_size: int = 5,
     det_threshold: float = 0.5,
     force_update: bool = False,
-    max_len: int = 64,
+    max_len: int = 128,
   ) -> Tuple[List[str], List[List[str]]]:
     """Two-stage inference.
 
