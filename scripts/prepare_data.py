@@ -15,6 +15,7 @@ def main():
   parser.add_argument("--raw-dir", default="cup2_dataset")
   parser.add_argument("--output-dir", default="data/processed")
   parser.add_argument("--max-samples", type=int, default=5000)
+  parser.add_argument("--vocab-max-size", type=int, default=30000)
   parser.add_argument("--seed", type=int, default=42)
   args = parser.parse_args()
 
@@ -24,6 +25,7 @@ def main():
     processed_dir=args.output_dir,
     max_samples=args.max_samples,
     seed=args.seed,
+    vocab_max_size=args.vocab_max_size,
   )
 
   print("\n=== Data Preparation Complete ===")

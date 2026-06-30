@@ -52,11 +52,13 @@ def main() -> None:
         shutil.rmtree(path)
 
   if not args.skip_prepare:
+    vocab_max = str(cfg["data"].get("vocab_max_size", 30000))
     run([
       sys.executable, "scripts/prepare_data.py",
       "--raw-dir", args.raw_dir,
       "--output-dir", args.processed_dir,
       "--max-samples", str(max_samples),
+      "--vocab-max-size", vocab_max,
     ])
 
   if not args.skip_verify:

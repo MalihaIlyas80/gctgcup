@@ -114,17 +114,24 @@ def build_vocabulary(train_samples: List[Dict[str, Any]], max_size: int = 30000)
   """
   from collections import Counter
 
-  counter: Counter = Counter()
+  dst_counter: Counter = Counter()
+  src_counter: Counter = Counter()
   for s in train_samples:
     src_tokens, dst_tokens = _sample_comment_tokens(s)
-    counter.update(src_tokens)
-    counter.update(dst_tokens)
+    dst_counter.update(dst_tokens)
+    src_counter.update(src_tokens)
 
   vocab = Vocabulary()  # special tokens occupy ids 0..len(SPECIAL_TOKENS)-1
-  for tok, _freq in counter.most_common():
+  # Always include every reference (dst) token first — exact-match needs them in-vocab.
+  for tok, _freq in dst_counter.most_common():
     if len(vocab) >= max_size:
       break
     vocab.add_token(tok)
+  for tok, _freq in src_counter.most_common():
+    if len(vocab) >= max_size:
+      break
+    if tok not in vocab.token2id:
+      vocab.add_token(tok)
   return vocab
 
 

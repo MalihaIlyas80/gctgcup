@@ -60,7 +60,7 @@ class Trainer:
       self.scheduler.step()
     self.optimizer.zero_grad()
 
-  def train_epoch(self) -> float:
+  def train_epoch(self, phase: str = "joint") -> float:
     self.model.train()
     total_loss = 0.0
     n = 0
@@ -68,7 +68,7 @@ class Trainer:
     for step, batch in enumerate(tqdm(self.train_loader, desc="Train", leave=False)):
       batch = self._to_device(batch)
       with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-        out = self.model(batch, pos_weight=self.pos_weight)
+        out = self.model(batch, pos_weight=self.pos_weight, phase=phase)
         loss = out["loss"] / self.grad_accumulation_steps
       self.scaler.scale(loss).backward()
       total_loss += out["loss"].item()
@@ -78,6 +78,11 @@ class Trainer:
     if n % self.grad_accumulation_steps != 0:
       self._optimizer_step()
     return total_loss / max(n, 1)
+
+  def _val_score(self, metrics, phase: str) -> float:
+    if phase == "detection":
+      return metrics.det_f1
+    return metrics.accuracy * 2.0 + metrics.bleu * 0.2 + metrics.sari * 0.2
 
   @torch.no_grad()
   def validate(self) -> Dict:
@@ -107,7 +112,7 @@ class Trainer:
       src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
       ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
-      gen_ids, no_upd_texts, beam_cands = self.model.generate(
+      gen_ids, no_upd_texts, beam_cands, surface_texts, beam_surfaces = self.model.generate(
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"],
@@ -115,19 +120,22 @@ class Trainer:
         det_threshold=self.det_threshold,
         comments=batch["src_descs"],
         src_descs=src_tok_texts,
+        src_tokens_list=batch["src_tokens_list"],
+        id2token=self.vocab.id2token if self.vocab else {},
         return_beam_candidates=True,
         force_update=True,
       )
 
-      for ids, no_upd, cands, ref, src in zip(
-        gen_ids, no_upd_texts, beam_cands, ref_tok_texts, src_tok_texts
+      for ids, no_upd, cands, surf, surf_cands, ref, src in zip(
+        gen_ids, no_upd_texts, beam_cands, surface_texts, beam_surfaces,
+        ref_tok_texts, src_tok_texts,
       ):
         if no_upd is not None:
           pred_text = no_upd
           beam_texts = [no_upd] * 5
         else:
-          pred_text = " ".join(self.vocab.decode(ids))
-          beam_texts = [" ".join(self.vocab.decode(c)) for c in cands]
+          pred_text = surf or " ".join(self.vocab.decode(ids))
+          beam_texts = surf_cands if surf_cands else [" ".join(self.vocab.decode(c)) for c in cands]
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)
@@ -155,9 +163,21 @@ class Trainer:
         out[k] = v
     return out
 
-  def fit(self, epochs: int) -> Dict:
+  def _reset_early_stop(self) -> None:
+    self.epochs_no_improve = 0
+    self.best_val_score = float("-inf")
+    self.best_val_loss = float("inf")
+
+  def fit(self, epochs: int, phase: str = "joint", resume: bool = True) -> Dict:
+    if phase == "detection":
+      self.model.set_training_phase("detection")
+    elif phase == "update":
+      self.model.set_training_phase("update")
+    else:
+      self.model.set_training_phase("joint")
+
     best_path = os.path.join(self.checkpoint_dir, "best.pt")
-    if os.path.exists(best_path):
+    if resume and phase == "joint" and os.path.exists(best_path):
       print("Resuming from best.pt ...")
       self.load_checkpoint("best.pt")
 
@@ -172,20 +192,18 @@ class Trainer:
     history = []
     for epoch in range(1, epochs + 1):
       t0 = time.time()
-      train_loss = self.train_epoch()
+      train_loss = self.train_epoch(phase=phase)
       metrics = self.validate()
       val_loss = metrics.per_sample["val_loss"]
       elapsed = time.time() - t0
-
-      # Prioritize exact-match accuracy (TG-CUP headline metric) + BLEU/SARI.
-      val_score = metrics.accuracy * 2.0 + metrics.bleu * 0.2 + metrics.sari * 0.2
+      val_score = self._val_score(metrics, phase)
 
       print(
-        f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+        f"Epoch {epoch}/{epochs} [{phase}] | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
         f"Acc={metrics.accuracy:.2f}% | SARI={metrics.sari:.2f}% | BLEU={metrics.bleu:.2f}% | "
         f"Det-F1={metrics.det_f1:.2f}% | score={val_score:.2f} | time={elapsed:.1f}s"
       )
-      history.append({"epoch": epoch, "train_loss": train_loss, **metrics.to_dict()})
+      history.append({"epoch": epoch, "phase": phase, "train_loss": train_loss, **metrics.to_dict()})
 
       if val_score > self.best_val_score:
         self.best_val_score = val_score
@@ -203,6 +221,33 @@ class Trainer:
       "history": history,
       "best_val_loss": self.best_val_loss,
       "best_val_score": self.best_val_score,
+      "phase": phase,
+    }
+
+  def fit_two_stage(self, detection_epochs: int, update_epochs: int) -> Dict:
+    """Stage 1: train detection. Stage 2: train update decoder (detector frozen)."""
+    print("\n" + "=" * 70)
+    print(f" STAGE 1 ? Detection ({detection_epochs} epochs max)")
+    print("=" * 70)
+    self._reset_early_stop()
+    det_result = self.fit(detection_epochs, phase="detection", resume=False)
+    best_path = os.path.join(self.checkpoint_dir, "best.pt")
+    if os.path.exists(best_path):
+      print("Loading best detection checkpoint for stage 2 ...")
+      self.load_checkpoint("best.pt")
+
+    print("\n" + "=" * 70)
+    print(f" STAGE 2 ? Update generation ({update_epochs} epochs max)")
+    print("=" * 70)
+    self._reset_early_stop()
+    upd_result = self.fit(update_epochs, phase="update", resume=False)
+
+    return {
+      "detection": det_result,
+      "update": upd_result,
+      "best_val_score": upd_result["best_val_score"],
+      "best_val_loss": upd_result["best_val_loss"],
+      "history": det_result["history"] + upd_result["history"],
     }
 
   def save_checkpoint(self, name: str) -> None:

@@ -65,14 +65,17 @@ def main() -> None:
   print(f"Forward OK | loss={out['loss'].item():.4f}")
 
   src_tok = [" ".join(t) for t in batch["src_tokens_list"]]
-  gen_ids, no_upd, _ = model.generate(
+  gen_ids, no_upd, _, surf, _ = model.generate(
     batch["src_ids"], batch["edit_ids"],
     batch["src_methods"], batch["dst_methods"],
     batch["graphs"],
     beam_size=1, force_update=True,
     comments=batch["src_descs"], src_descs=src_tok,
+    src_tokens_list=batch["src_tokens_list"],
+    id2token=vocab.id2token,
+    return_beam_candidates=True,
   )
-  pred = " ".join(vocab.decode(gen_ids[0])) if gen_ids[0] else no_upd[0]
+  pred = surf[0] if surf[0] else (" ".join(vocab.decode(gen_ids[0])) if gen_ids[0] else no_upd[0])
   ref = " ".join(batch["dst_tokens_list"][0])
   print(f"Generate OK | pred={pred[:80]!r}")
   print(f"Reference   | ref ={ref[:80]!r}")

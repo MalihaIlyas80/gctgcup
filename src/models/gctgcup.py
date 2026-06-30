@@ -144,20 +144,33 @@ class GCTGCUP(nn.Module):
     encoded = self.seq_encoder(emb, src_key_padding_mask=key_padding)
     return encoded, mask, combined
 
+  @staticmethod
+  def _copy_surface_aligned(
+    src_tokens: List[str],
+    edit_ids_row: torch.Tensor,
+    id2token: Dict[int, str],
+  ) -> List[str]:
+    """One surface string per encoder position (comment + sep + edit)."""
+    row = ["<s>"] + list(src_tokens) + ["</s>", "<sep>"]
+    for tid in edit_ids_row.tolist():
+      row.append(id2token.get(int(tid), "<unk>"))
+    return row
+
   def _mixture_logprobs(
     self,
     decoded: torch.Tensor,
     seq_enc: torch.Tensor,
     seq_mask: torch.Tensor,
     seq_ids: torch.Tensor,
-  ) -> torch.Tensor:
+    return_components: bool = False,
+  ):
     """Pointer-generator mixture of generation + copy distributions.
 
     decoded:  (B, T, D) decoder states
     seq_enc:  (B, S, D) encoder states of (old comment + edit) source
     seq_mask: (B, S) bool, True for real tokens
     seq_ids:  (B, S) vocab ids of the source tokens (for copy scatter)
-    Returns log P(token) of shape (B, T, V).
+    Returns log P(token) of shape (B, T, V), or (log_probs, p_gen, copy_attn).
     """
     # Force fp32 here: under AMP, probabilities + log(clamp(1e-9)) would
     # underflow in fp16 and produce NaNs.
@@ -180,7 +193,10 @@ class GCTGCUP(nn.Module):
       final = p_gen * gen_prob                                         # (B, T, V)
       src_index = seq_ids.unsqueeze(1).expand(B, T, seq_ids.size(1))   # (B, T, S)
       final = final.scatter_add(2, src_index, (1.0 - p_gen) * copy_attn)
-      return torch.log(final.clamp(min=1e-9))
+      log_probs = torch.log(final.clamp(min=1e-9))
+      if return_components:
+        return log_probs, p_gen, copy_attn
+      return log_probs
 
   def _encode_graph_batch(
     self,
@@ -280,9 +296,10 @@ class GCTGCUP(nn.Module):
     batch: Dict,
     teacher_forcing: bool = True,
     pos_weight: Optional[torch.Tensor] = None,
+    phase: str = "joint",
   ) -> Dict[str, torch.Tensor]:
+    """phase: 'joint' | 'detection' (stage-1 only) | 'update' (stage-2 only)."""
     device = next(self.parameters()).device
-    # Encode code pair ONCE with GraphCodeBERT, then reuse for detection + update.
     code_h, code_mask = self.code_semantic.encode_code_pair(
       batch["src_methods"], batch["dst_methods"], device
     )
@@ -296,8 +313,9 @@ class GCTGCUP(nn.Module):
 
     update_mask = batch["labels"].bool()
     result = {"det_loss": det_loss, "det_logits": det_logits}
+    upd_loss = torch.tensor(0.0, device=det_logits.device)
 
-    if update_mask.any() and teacher_forcing:
+    if phase != "detection" and update_mask.any() and teacher_forcing:
       idx = update_mask.nonzero(as_tuple=True)[0]
       upd_logprobs = self.forward_update(
         batch["src_ids"][idx],
@@ -308,20 +326,56 @@ class GCTGCUP(nn.Module):
         [batch["graphs"][i] for i in idx.tolist()],
       )
       targets = batch["dst_ids"][idx, 1:]
-      # Diff-aware NLL: up-weight edited tokens so the model learns to EDIT,
-      # not just copy the old comment (the cause of ~0 exact-match accuracy).
       upd_loss = self._diff_aware_nll(
         upd_logprobs, targets, batch["src_ids"][idx],
         edit_weight=self.edit_weight,
       )
-      result["upd_loss"] = upd_loss
-    else:
-      result["upd_loss"] = torch.tensor(0.0, device=det_logits.device)
+    result["upd_loss"] = upd_loss
 
-    result["loss"] = (
-      self.det_loss_weight * det_loss + self.upd_loss_weight * result["upd_loss"]
-    )
+    if phase == "detection":
+      result["loss"] = det_loss
+    elif phase == "update":
+      result["loss"] = upd_loss
+    else:
+      result["loss"] = (
+        self.det_loss_weight * det_loss + self.upd_loss_weight * upd_loss
+      )
     return result
+
+  def set_training_phase(self, phase: str) -> None:
+    """Freeze/unfreeze submodules for sequential two-stage training."""
+    det_modules = [self.detector]
+    upd_modules = [
+      self.token_embed, self.pos_enc, self.ggnn, self.seq_encoder,
+      self.decoder, self.output_proj, self.copy_key, self.p_gen, self.fuse_code_sem,
+    ]
+    if phase == "detection":
+      for m in upd_modules:
+        for p in m.parameters():
+          p.requires_grad = False
+      for m in det_modules:
+        for p in m.parameters():
+          p.requires_grad = True
+    elif phase == "update":
+      for m in det_modules:
+        for p in m.parameters():
+          p.requires_grad = False
+      for m in upd_modules:
+        for p in m.parameters():
+          p.requires_grad = True
+    else:
+      for m in det_modules + upd_modules:
+        for p in m.parameters():
+          p.requires_grad = True
+
+  _SKIP_OUTPUT = frozenset({
+    "<sep>", "<s>", "</s>", "<pad>", "<unk>",
+    "<before>", "<after>", "<equal>", "<replace>", "<insert>", "<delete>",
+  })
+
+  @classmethod
+  def _format_surface(cls, tokens: List[str]) -> str:
+    return " ".join(t for t in tokens if t not in cls._SKIP_OUTPUT)
 
   @torch.no_grad()
   def generate(
@@ -336,29 +390,23 @@ class GCTGCUP(nn.Module):
     det_threshold: float = 0.45,
     comments: Optional[List[str]] = None,
     src_descs: Optional[List[str]] = None,
+    src_tokens_list: Optional[List[List[str]]] = None,
+    id2token: Optional[Dict[int, str]] = None,
     return_beam_candidates: bool = False,
     force_update: bool = False,
   ) -> tuple:
-    """Generate updated comments with detection gate + beam search.
+    """Two-stage inference: detect outdated → generate update (or keep original).
 
-    For samples where detector predicts no update needed, returns src_descs[i]
-    directly (no tokenization round-trip) so label=0 exact matches are preserved.
-
-    force_update=True bypasses the detection gate and generates an updated
-    comment for EVERY sample. This is used for the fair, TG-CUP-style update
-    evaluation on the outdated-only subset (TG-CUP always updates, never gates).
-
-    Returns:
-      token_ids: List[List[int]] — generated token ids (empty list for no-update)
-      no_update_texts: List[Optional[str]] — src_desc for no-update samples, None otherwise
-      beam_candidates (optional): List[List[List[int]]]
+    force_update=True skips the detection gate (TG-CUP-style update eval only).
+    Surface-token beam search copies OOV identifiers verbatim for exact-match accuracy.
     """
     device = src_ids.device
     B = src_ids.size(0)
     comments = comments or [""] * B
     src_descs = src_descs or [""] * B
+    src_tokens_list = src_tokens_list or [[] for _ in range(B)]
+    id2token = id2token or {}
 
-    # Encode code pair ONCE; reuse for detection and every decode step.
     code_h, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
     det_logits = self.detector(old_codes, new_codes, comments, code_cache=(code_h, code_mask))
     det_probs = torch.sigmoid(det_logits)
@@ -369,38 +417,43 @@ class GCTGCUP(nn.Module):
 
     token_ids: List[List[int]] = []
     no_update_texts: List[Optional[str]] = []
+    surface_texts: List[str] = []
     beam_results: List[List[List[int]]] = []
+    beam_surface_results: List[List[str]] = []
 
     for i in range(B):
-      # ── No-update path: return original comment string directly ──
-      # This avoids tokenization round-trip errors that destroy exact match
       if not needs_update[i]:
         token_ids.append([])
         no_update_texts.append(src_descs[i])
+        surface_texts.append(src_descs[i])
         beam_results.append([[]])
+        beam_surface_results.append([src_descs[i]])
         continue
 
       no_update_texts.append(None)
 
-      # ── Encode inputs (copy source = old comment + edit sequence) ──
       seq_enc, seq_mask, seq_ids = self._encode_sequence_modal(src_ids[i:i+1], edit_ids[i:i+1])
       graph_enc, graph_mask = self._encode_graph_batch([graphs[i]], device)
-      code_sem = self.fuse_code_sem(code_h[i:i+1])           # reuse cached encoding
+      code_sem = self.fuse_code_sem(code_h[i:i+1])
       code_mask_i = code_mask[i:i+1]
       memory = torch.cat([code_sem, seq_enc, graph_enc], dim=1)
       mem_mask = torch.cat([code_mask_i, seq_mask, graph_mask], dim=1)
 
-      # ── Length-normalized beam search over the copy-mixture distribution ──
-      beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), 0.0)]
+      combined_surface = self._copy_surface_aligned(
+        src_tokens_list[i], edit_ids[i], id2token,
+      )
+
+      # Surface-aware beam: copy actions emit source surface tokens (OOV-safe).
+      beams: List[tuple] = [(torch.tensor([[self.sos_id]], device=device), [], 0.0)]
       completed: List[tuple] = []
 
       for _ in range(max_len):
         if not beams:
           break
         new_beams: List[tuple] = []
-        for seq, score in beams:
+        for seq, surf, score in beams:
           if seq[0, -1].item() == self.eos_id:
-            completed.append((seq, score))
+            completed.append((seq, surf, score))
             continue
 
           tgt_emb = self._embed_seq(seq)
@@ -409,35 +462,72 @@ class GCTGCUP(nn.Module):
             tgt=tgt_emb, memory=memory, tgt_mask=tgt_mask,
             memory_key_padding_mask=~mem_mask,
           )
-          log_probs = self._mixture_logprobs(dec[:, -1:], seq_enc, seq_mask, seq_ids)[0, -1]
+          log_probs, p_gen, copy_attn = self._mixture_logprobs(
+            dec[:, -1:], seq_enc, seq_mask, seq_ids, return_components=True,
+          )
+          lp = log_probs[0, 0]
+          pg = float(p_gen[0, 0, 0].item())
+          ca = copy_attn[0, 0]
+          seq_len = seq.size(1)
 
-          # Block only degenerate loops (same token 3x in a row); do NOT force
-          # length from the old comment, which used to wreck exact match.
+          if seq.size(1) == 1:
+            lp = lp.clone()
+            lp[self.eos_id] -= 1e9
+
+          actions: List[tuple] = []
+
+          copy_scores = (1.0 - pg) * ca
+          copy_scores = copy_scores.masked_fill(~seq_mask[0], float("-inf"))
+          n_copy = min(beam_size, int((copy_scores > -1e8).sum().item()))
+          if n_copy > 0:
+            top_copy = torch.topk(copy_scores, n_copy)
+            for val, pos in zip(top_copy.values, top_copy.indices):
+              pos_i = int(pos.item())
+              tok_id = int(seq_ids[0, pos_i].item())
+              tok_str = combined_surface[pos_i] if pos_i < len(combined_surface) else id2token.get(tok_id, "<unk>")
+              if tok_str in self._SKIP_OUTPUT:
+                continue
+              actions.append(("copy", tok_id, tok_str, float(val.item())))
+
+          gen_lp = lp.clone()
           if seq.size(1) >= 2:
             last, last2 = seq[0, -1].item(), seq[0, -2].item()
             if last == last2 and last not in (self.sos_id, self.eos_id, self.pad_id):
-              log_probs[last] -= 1e9
+              gen_lp[last] -= 1e9
 
-          # Require at least one real token before EOS.
-          if seq.size(1) == 1:
-            log_probs[self.eos_id] -= 1e9
+          top_gen = torch.topk(gen_lp, beam_size)
+          for val, tok_id_t in zip(top_gen.values, top_gen.indices):
+            tok_id = int(tok_id_t.item())
+            if tok_id in (self.sos_id, self.pad_id):
+              continue
+            if tok_id == self.eos_id and len(surf) == 0:
+              continue
+            tok_str = id2token.get(tok_id, "<unk>")
+            if tok_id == self.eos_id:
+              tok_str = "</s>"
+            actions.append(("gen", tok_id, tok_str, float(val.item())))
 
-          seq_len = seq.size(1)
-          topk = torch.topk(log_probs, beam_size, dim=-1)
-          for k in range(beam_size):
-            tok = topk.indices[k].view(1, 1)
-            new_score = (score * seq_len + topk.values[k].item()) / (seq_len + 1)
-            new_beams.append((torch.cat([seq, tok], dim=1), new_score))
+          for _, tok_id, tok_str, act_score in actions:
+            new_seq = torch.cat([seq, torch.tensor([[tok_id]], device=device)], dim=1)
+            new_surf = list(surf)
+            if tok_str != "</s>":
+              new_surf.append(tok_str)
+            new_score = (score * seq_len + act_score) / (seq_len + 1)
+            new_beams.append((new_seq, new_surf, new_score))
 
-        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
-        if all(s[0, -1].item() == self.eos_id for s, _ in beams):
+        beams = sorted(new_beams, key=lambda x: x[2], reverse=True)[:beam_size * 2]
+        if all(b[0][0, -1].item() == self.eos_id for b in beams):
           break
 
-      finished = sorted(completed + beams, key=lambda x: x[1], reverse=True)[:beam_size]
-      cands = [[t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)] for seq, _ in finished]
-      token_ids.append(cands[0] if cands else [])
-      beam_results.append(cands if cands else [[]])
+      finished = sorted(completed + beams, key=lambda x: x[2], reverse=True)[:beam_size]
+      cand_ids = [[t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)] for seq, _, _ in finished]
+      cand_surfs = [self._format_surface(surf) for _, surf, _ in finished]
+
+      token_ids.append(cand_ids[0] if cand_ids else [])
+      surface_texts.append(cand_surfs[0] if cand_surfs else "")
+      beam_results.append(cand_ids if cand_ids else [[]])
+      beam_surface_results.append(cand_surfs if cand_surfs else [""])
 
     if return_beam_candidates:
-      return token_ids, no_update_texts, beam_results
-    return token_ids, no_update_texts
+      return token_ids, no_update_texts, beam_results, surface_texts, beam_surface_results
+    return token_ids, no_update_texts, surface_texts

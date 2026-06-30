@@ -108,8 +108,15 @@ def main():
   )
 
   epochs = args.epochs or cfg["training"]["update_epochs"]
-  print(f"\nTraining GC-TGCUP for {epochs} epochs ...")
-  result = trainer.fit(epochs)
+  det_epochs = cfg["training"].get("detection_epochs", 5)
+  two_stage = cfg["training"].get("two_stage", True)
+
+  if two_stage:
+    print(f"\nTwo-stage training: detection ({det_epochs} ep) -> update ({epochs} ep)")
+    result = trainer.fit_two_stage(det_epochs, epochs)
+  else:
+    print(f"\nJoint training for {epochs} epochs ...")
+    result = trainer.fit(epochs, phase="joint")
 
   report_path = os.path.join(cfg["training"]["checkpoint_dir"], "training_history.json")
   with open(report_path, "w") as f:

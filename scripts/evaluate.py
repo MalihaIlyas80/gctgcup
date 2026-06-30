@@ -48,7 +48,7 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5,
     src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
     ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
-    gen_ids, no_upd_texts, beam_ids = model.generate(
+    gen_ids, no_upd_texts, beam_ids, surface_texts, beam_surfaces = model.generate(
       batch["src_ids"], batch["edit_ids"],
       batch["src_methods"], batch["dst_methods"],
       batch["graphs"],
@@ -56,18 +56,21 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5,
       det_threshold=det_threshold,
       comments=batch["src_descs"],
       src_descs=src_tok_texts,
+      src_tokens_list=batch["src_tokens_list"],
+      id2token=vocab.id2token,
       return_beam_candidates=True,
       force_update=True,
     )
-    for ids, no_upd, cands, ref, src in zip(
-      gen_ids, no_upd_texts, beam_ids, ref_tok_texts, src_tok_texts
+    for ids, no_upd, cands, surf, surf_cands, ref, src in zip(
+      gen_ids, no_upd_texts, beam_ids, surface_texts, beam_surfaces,
+      ref_tok_texts, src_tok_texts,
     ):
       if no_upd is not None:
         pred_text = no_upd
         beam_cands.append([no_upd] * beam_size)
       else:
-        pred_text = " ".join(vocab.decode(ids))
-        beam_cands.append([" ".join(vocab.decode(c)) for c in cands])
+        pred_text = surf or " ".join(vocab.decode(ids))
+        beam_cands.append(surf_cands if surf_cands else [" ".join(vocab.decode(c)) for c in cands])
       predictions.append(pred_text)
       references.append(ref)
       sources.append(src)
