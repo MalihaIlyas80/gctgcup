@@ -1,5 +1,4 @@
-# GC-TGCUP — proven architecture to beat TG-CUP (pointer-gen + GGNN + GraphCodeBERT).
-# This is the setup that already reached BLEU~71% and METEOR~77% on your data.
+# GC-TGCUP — joint train + edit-aware decode (accuracy-focused, faster eval).
 project_name: "GC-TGCUP"
 
 data:
@@ -11,7 +10,7 @@ data:
   long_comment_threshold: 25
   min_comment_len: 3
   seed: 42
-  vocab_max_size: 15000        # dst tokens prioritized for exact-match
+  vocab_max_size: 15000
 
 model:
   hidden_dim: 256
@@ -21,8 +20,8 @@ model:
   ggnn_steps: 6
   dropout: 0.2
   graphcodebert: "microsoft/graphcodebert-base"
-  freeze_graphcodebert: false   # fine-tune GraphCodeBERT (mandatory)
-  edit_weight: 10.0             # up-weight edited tokens vs copy-collapse
+  freeze_graphcodebert: false
+  edit_weight: 5.0              # sequence-diff loss on changed comment tokens
   det_loss_weight: 0.15
   upd_loss_weight: 0.85
   beam_size: 5
@@ -30,16 +29,18 @@ model:
   det_threshold: 0.5
 
 training:
-  two_stage: true                # Stage 1 detection -> Stage 2 update
-  detection_epochs: 6            # train OutdatedCommentDetector first
-  update_epochs: 18              # then train pointer-generator updater
+  two_stage: false              # joint: detection + update together (proven BLEU path)
+  detection_epochs: 6           # only if two_stage: true
+  update_epochs: 14               # joint epochs (~1.2h on Kaggle T4)
   batch_size: 8
-  max_valid_batches: 12
+  max_valid_batches: 8          # faster validation (~640 samples)
+  valid_beam_size: 5            # match final eval beam
+  pos_oversample: 2.5           # oversample outdated comments in training
   learning_rate: 3.0e-4
   graphcodebert_lr: 2.0e-5
   weight_decay: 0.01
-  patience: 6
-  grad_accumulation_steps: 4     # effective batch = 32
+  patience: 5
+  grad_accumulation_steps: 4
   checkpoint_dir: "checkpoints"
   pos_weight: 2.5
 

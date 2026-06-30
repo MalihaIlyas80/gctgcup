@@ -146,6 +146,37 @@ def flatten_edit_sequence(
     return seq
 
 
+def apply_comment_code_renames(
+    src_tokens: list[str],
+    code_change_seq: list,
+) -> list[str]:
+    """
+    Apply code identifier renames to comment tokens (TG-CUP-style local edits).
+    When code does replace(old, new), update matching tokens in the old comment.
+    """
+    out = list(src_tokens)
+    for triple in code_change_seq or []:
+        if len(triple) != 3 or triple[2] != "replace":
+            continue
+        old_t, new_t = triple[0], triple[1]
+        if not old_t or not new_t or old_t in ("<con>", "<pad>"):
+            continue
+        for i, tok in enumerate(out):
+            if tok == old_t or tok.lower() == old_t.lower():
+                out[i] = new_t
+    return out
+
+
+def comment_has_code_rename(src_tokens: list[str], code_change_seq: list) -> bool:
+    src_lower = {t.lower() for t in src_tokens}
+    for triple in code_change_seq or []:
+        if len(triple) == 3 and triple[2] == "replace":
+            old_t = triple[0]
+            if old_t and old_t.lower() in src_lower:
+                return True
+    return False
+
+
 def is_nciu_sample(sample: Dict[str, Any]) -> bool:
     """
     NCIU (Non-Code-Indicative Update): code changes don't appear in comment.

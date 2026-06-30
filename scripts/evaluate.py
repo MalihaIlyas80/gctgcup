@@ -57,6 +57,7 @@ def evaluate_model(model, loader, vocab, device, det_threshold=0.5, beam_size=5,
       comments=batch["src_descs"],
       src_descs=src_tok_texts,
       src_tokens_list=batch["src_tokens_list"],
+      code_change_seqs=batch["code_change_seqs"],
       id2token=vocab.id2token,
       return_beam_candidates=True,
       force_update=True,
@@ -132,7 +133,8 @@ def main():
   parser.add_argument("--processed-dir", default="data/processed")
   parser.add_argument("--checkpoint", default="checkpoints/best.pt")
   parser.add_argument("--beam-size", type=int, default=None)
-  parser.add_argument("--max-batches", type=int, default=None)
+  parser.add_argument("--max-batches", type=int, default=None,
+                      help="Cap eval batches for quick check (e.g. 50 ~ 400 samples)")
   args = parser.parse_args()
 
   with open(args.config, encoding="utf-8") as f:

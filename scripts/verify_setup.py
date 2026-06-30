@@ -72,6 +72,7 @@ def main() -> None:
     beam_size=1, force_update=True,
     comments=batch["src_descs"], src_descs=src_tok,
     src_tokens_list=batch["src_tokens_list"],
+    code_change_seqs=batch["code_change_seqs"],
     id2token=vocab.id2token,
     return_beam_candidates=True,
   )

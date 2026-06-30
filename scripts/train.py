@@ -5,9 +5,11 @@ import json
 import os
 import sys
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -68,16 +70,21 @@ def main():
     long_threshold=cfg["data"]["long_comment_threshold"],
   )
 
-  num_workers = min(4, (os.cpu_count() or 1) // 2)
+  num_workers = 0 if device.type == "cuda" else min(4, (os.cpu_count() or 1) // 2)
+  pos_oversample = cfg["training"].get("pos_oversample", 2.0)
+  sample_weights = [
+    pos_oversample if s.get("label") else 1.0 for s in train_ds.samples
+  ]
+  train_sampler = WeightedRandomSampler(
+    sample_weights, num_samples=len(sample_weights), replacement=True,
+  )
   train_loader = DataLoader(
     train_ds, batch_size=cfg["training"]["batch_size"],
-    shuffle=True, collate_fn=collate_fn, num_workers=num_workers,
-    persistent_workers=num_workers > 0,
+    sampler=train_sampler, collate_fn=collate_fn, num_workers=num_workers,
   )
   valid_loader = DataLoader(
     valid_ds, batch_size=cfg["training"]["batch_size"],
     shuffle=False, collate_fn=collate_fn, num_workers=num_workers,
-    persistent_workers=num_workers > 0,
   )
 
   model = GCTGCUP(
@@ -111,6 +118,7 @@ def main():
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),
     det_threshold=cfg["model"].get("det_threshold", 0.5),
+    valid_beam_size=cfg["training"].get("valid_beam_size", 5),
   )
 
   epochs = args.epochs or cfg["training"]["update_epochs"]

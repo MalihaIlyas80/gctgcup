@@ -10,6 +10,7 @@ Extends TG-CUP with:
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 from typing import Dict, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.data.ast_diff import ASTDiffGraph
+from src.data.cleaning import apply_comment_code_renames, comment_has_code_rename
 
 from .detection import OutdatedCommentDetector
 from .ggnn import GGNN
@@ -257,37 +259,37 @@ class GCTGCUP(nn.Module):
     # Pointer-generator: copy over the (old comment + edit) source sequence
     return self._mixture_logprobs(decoded, seq_enc, seq_mask, seq_ids)
 
-  def _diff_aware_nll(
+  def _sequence_diff_aware_nll(
     self,
     logprobs: torch.Tensor,
     targets: torch.Tensor,
-    src_ids: torch.Tensor,
-    edit_weight: float = 3.0,
+    src_tokens_batch: List[List[str]],
+    dst_tokens_batch: List[List[str]],
+    edit_weight: float = 5.0,
   ) -> torch.Tensor:
-    """NLL that UP-WEIGHTS target tokens absent from the old comment.
-
-    For outdated samples the new comment ≈ old comment + a few edits, so plain
-    NLL is minimised by copying the old comment (high BLEU, ~0 exact match).
-    By weighting the *edited* tokens (those not present in the old comment) we
-    force the model to actually learn the edit instead of collapsing to copy.
-    """
+    """Up-weight only tokens that differ between old and new comment (aligned diff)."""
     B, T, V = logprobs.shape
     nll = F.nll_loss(
       logprobs.reshape(-1, V), targets.reshape(-1),
       ignore_index=self.pad_id, reduction="none",
     ).view(B, T)
 
-    in_src = torch.zeros(B, V, dtype=torch.bool, device=targets.device)
-    in_src.scatter_(1, src_ids.clamp(min=0), True)
-    tgt_in_src = in_src.gather(1, targets.clamp(min=0))            # (B, T)
+    weights = torch.ones_like(targets, dtype=logprobs.dtype)
+    for b in range(B):
+      dst_toks = dst_tokens_batch[b]
+      pos_w = torch.ones(T, device=targets.device, dtype=logprobs.dtype)
+      sm = difflib.SequenceMatcher(
+        None, src_tokens_batch[b], dst_toks, autojunk=False,
+      )
+      for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+          continue
+        for j in range(j1, min(j2, len(dst_toks))):
+          if j < T:
+            pos_w[j] = edit_weight
+      weights[b] = pos_w
 
-    weights = torch.where(
-      tgt_in_src,
-      torch.ones_like(targets, dtype=logprobs.dtype),
-      torch.full_like(targets, edit_weight, dtype=logprobs.dtype),
-    )
     weights = weights.masked_fill(targets.eq(self.pad_id), 0.0)
-
     nll = nll * weights
     return nll.sum() / weights.sum().clamp(min=1.0)
 
@@ -334,8 +336,10 @@ class GCTGCUP(nn.Module):
         [batch["graphs"][i] for i in idx.tolist()],
       )
       targets = batch["dst_ids"][idx, 1:]
-      upd_loss = self._diff_aware_nll(
-        upd_logprobs, targets, batch["src_ids"][idx],
+      src_tok = [batch["src_tokens_list"][i] for i in idx.tolist()]
+      dst_tok = [batch["dst_tokens_list"][i] for i in idx.tolist()]
+      upd_loss = self._sequence_diff_aware_nll(
+        upd_logprobs, targets, src_tok, dst_tok,
         edit_weight=self.edit_weight,
       )
     elif phase == "update":
@@ -381,6 +385,44 @@ class GCTGCUP(nn.Module):
       for p in self.parameters():
         p.requires_grad = True
 
+  @classmethod
+  def merge_src_prediction(cls, src_tokens: List[str], pred_tokens: List[str]) -> str:
+    """Merge copy-stable spans from src with edited spans from the model."""
+    sm = difflib.SequenceMatcher(None, src_tokens, pred_tokens, autojunk=False)
+    merged: List[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+      if tag == "equal":
+        merged.extend(src_tokens[i1:i2])
+      elif tag in ("replace", "insert"):
+        merged.extend(pred_tokens[j1:j2])
+    return cls._format_surface(merged)
+
+  @classmethod
+  def _dedupe_candidates(cls, candidates: List[str]) -> List[str]:
+    seen, out = set(), []
+    for c in candidates:
+      c = c.strip()
+      if c and c not in seen:
+        seen.add(c)
+        out.append(c)
+    return out
+
+  @classmethod
+  def _pick_primary_prediction(
+    cls,
+    src_tokens: List[str],
+    model_pred: str,
+    rule_pred: str,
+    merge_pred: str,
+    code_change_seq: list,
+  ) -> str:
+    """Prefer rule-based rename when code edits touch the comment."""
+    if rule_pred and comment_has_code_rename(src_tokens, code_change_seq):
+      return rule_pred
+    if merge_pred:
+      return merge_pred
+    return model_pred
+
   _SKIP_OUTPUT = frozenset({
     "<sep>", "<s>", "</s>", "<pad>", "<unk>",
     "<before>", "<after>", "<equal>", "<replace>", "<insert>", "<delete>",
@@ -404,6 +446,7 @@ class GCTGCUP(nn.Module):
     comments: Optional[List[str]] = None,
     src_descs: Optional[List[str]] = None,
     src_tokens_list: Optional[List[List[str]]] = None,
+    code_change_seqs: Optional[List[list]] = None,
     id2token: Optional[Dict[int, str]] = None,
     return_beam_candidates: bool = False,
     force_update: bool = False,
@@ -418,6 +461,7 @@ class GCTGCUP(nn.Module):
     comments = comments or [""] * B
     src_descs = src_descs or [""] * B
     src_tokens_list = src_tokens_list or [[] for _ in range(B)]
+    code_change_seqs = code_change_seqs or [[] for _ in range(B)]
     id2token = id2token or {}
 
     code_h, code_mask = self.code_semantic.encode_code_pair(old_codes, new_codes, device)
@@ -536,10 +580,23 @@ class GCTGCUP(nn.Module):
       cand_ids = [[t for t in seq[0, 1:].tolist() if t not in (self.eos_id,)] for seq, _, _ in finished]
       cand_surfs = [self._format_surface(surf) for _, surf, _ in finished]
 
+      model_pred = cand_surfs[0] if cand_surfs else ""
+      pred_toks = model_pred.split() if model_pred else []
+      rule_pred = self._format_surface(
+        apply_comment_code_renames(src_tokens_list[i], code_change_seqs[i]),
+      )
+      merge_pred = (
+        self.merge_src_prediction(src_tokens_list[i], pred_toks) if pred_toks else ""
+      )
+      all_cands = self._dedupe_candidates([rule_pred, merge_pred] + cand_surfs)
+      primary = self._pick_primary_prediction(
+        src_tokens_list[i], model_pred, rule_pred, merge_pred, code_change_seqs[i],
+      )
+
       token_ids.append(cand_ids[0] if cand_ids else [])
-      surface_texts.append(cand_surfs[0] if cand_surfs else "")
+      surface_texts.append(primary)
       beam_results.append(cand_ids if cand_ids else [[]])
-      beam_surface_results.append(cand_surfs if cand_surfs else [""])
+      beam_surface_results.append(all_cands[: max(beam_size, 1)] or [""])
 
     if return_beam_candidates:
       return token_ids, no_update_texts, beam_results, surface_texts, beam_surface_results

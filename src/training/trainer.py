@@ -30,6 +30,7 @@ class Trainer:
     pos_weight: Optional[torch.Tensor] = None,
     grad_accumulation_steps: int = 4,
     det_threshold: float = 0.5,
+    valid_beam_size: int = 5,
   ):
     self.model = model.to(device)
     self.train_loader = train_loader
@@ -41,6 +42,7 @@ class Trainer:
     self.vocab = vocab
     self.max_valid_batches = max_valid_batches
     self.det_threshold = det_threshold
+    self.valid_beam_size = valid_beam_size
     self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
     self.grad_accumulation_steps = grad_accumulation_steps
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -118,11 +120,12 @@ class Trainer:
         batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
         batch["graphs"],
-        beam_size=1,
+        beam_size=self.valid_beam_size,
         det_threshold=self.det_threshold,
         comments=batch["src_descs"],
         src_descs=src_tok_texts,
         src_tokens_list=batch["src_tokens_list"],
+        code_change_seqs=batch["code_change_seqs"],
         id2token=self.vocab.id2token if self.vocab else {},
         return_beam_candidates=True,
         force_update=True,
@@ -137,7 +140,9 @@ class Trainer:
           beam_texts = [no_upd] * 5
         else:
           pred_text = surf or " ".join(self.vocab.decode(ids))
-          beam_texts = surf_cands if surf_cands else [" ".join(self.vocab.decode(c)) for c in cands]
+          beam_texts = surf_cands if surf_cands else (
+            [" ".join(self.vocab.decode(c)) for c in cands]
+          )
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)
