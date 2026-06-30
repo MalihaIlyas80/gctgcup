@@ -20,7 +20,7 @@ def main():
   args = parser.parse_args()
 
   print(f"Preparing {args.max_samples} samples from {args.raw_dir} ...")
-  train_ds, valid_ds, test_ds, stats = prepare_datasets(
+  train_ds, valid_ds, test_ds, vocab = prepare_datasets(
     raw_dir=args.raw_dir,
     processed_dir=args.output_dir,
     max_samples=args.max_samples,
@@ -28,10 +28,17 @@ def main():
     vocab_max_size=args.vocab_max_size,
   )
 
+  stats_path = os.path.join(args.output_dir, "stats.json")
+  stats = {}
+  if os.path.exists(stats_path):
+    with open(stats_path, encoding="utf-8") as f:
+      stats = json.load(f)
+
   print("\n=== Data Preparation Complete ===")
   print(f"  Train : {len(train_ds)}")
   print(f"  Valid : {len(valid_ds)}")
   print(f"  Test  : {len(test_ds)}")
+  print(f"  Vocab : {len(vocab)}")
   print(f"  Positive (outdated) : {stats.get('positive', '?')}")
   print(f"  Negative (no update): {stats.get('negative', '?')}")
   print(f"  NCIU samples        : {stats.get('nciu', '?')}")
