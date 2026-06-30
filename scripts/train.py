@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.data.dataset import CUPDataset, collate_fn
+from src.data.dataset import CUPDataset, Vocabulary, collate_fn
 from src.models.gctgcup import GCTGCUP
 from src.training.trainer import Trainer
 
@@ -25,75 +25,72 @@ def load_jsonl(path):
 
 
 def build_optimizer(model, cfg):
-  """Separate LRs for GraphCodeBERT, CodeT5 updater, and the rest."""
-  bert_params, t5_params, other_params = [], [], []
+  bert_params, other_params = [], []
   for name, p in model.named_parameters():
     if not p.requires_grad:
       continue
-    if "updater" in name:
-      t5_params.append(p)
-    elif "code_encoder" in name or "comment_encoder" in name or "bert" in name:
+    if "bert" in name or "code_encoder" in name:
       bert_params.append(p)
     else:
       other_params.append(p)
-  groups = [
+  return torch.optim.AdamW([
     {"params": other_params, "lr": cfg["training"]["learning_rate"]},
     {"params": bert_params,  "lr": cfg["training"].get("graphcodebert_lr", 1e-5)},
-  ]
-  if t5_params:
-    groups.append({"params": t5_params, "lr": cfg["training"].get("update_lr", 5e-5)})
-  return torch.optim.AdamW(groups, weight_decay=cfg["training"]["weight_decay"])
+  ], weight_decay=cfg["training"]["weight_decay"])
 
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--config", default="configs/default.yaml")
+  parser.add_argument("--config", default="configs/kaggle_gpu.yaml")
   parser.add_argument("--processed-dir", default="data/processed")
   parser.add_argument("--epochs", type=int, default=None)
   args = parser.parse_args()
 
-  with open(args.config) as f:
+  with open(args.config, encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Device: {device}")
-  if device.type == "cpu":
-    n_threads = os.cpu_count() or 4
-    torch.set_num_threads(n_threads)
-    torch.set_num_interop_threads(max(1, n_threads // 2))
-    print(f"CPU threads: {n_threads} intra / {max(1, n_threads // 2)} inter")
 
-  train_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "train.jsonl")),
-                        long_threshold=cfg["data"]["long_comment_threshold"])
-  valid_ds = CUPDataset(load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")),
-                        long_threshold=cfg["data"]["long_comment_threshold"])
+  vocab = Vocabulary.load(os.path.join(args.processed_dir, "vocab.json"))
+  train_ds = CUPDataset(
+    load_jsonl(os.path.join(args.processed_dir, "train.jsonl")), vocab,
+    long_threshold=cfg["data"]["long_comment_threshold"],
+  )
+  valid_ds = CUPDataset(
+    load_jsonl(os.path.join(args.processed_dir, "valid.jsonl")), vocab,
+    long_threshold=cfg["data"]["long_comment_threshold"],
+  )
 
   num_workers = min(4, (os.cpu_count() or 1) // 2)
-  train_loader = DataLoader(train_ds, batch_size=cfg["training"]["batch_size"],
-                            shuffle=True, collate_fn=collate_fn, num_workers=num_workers,
-                            persistent_workers=num_workers > 0)
-  valid_loader = DataLoader(valid_ds, batch_size=cfg["training"]["batch_size"],
-                            shuffle=False, collate_fn=collate_fn, num_workers=num_workers,
-                            persistent_workers=num_workers > 0)
+  train_loader = DataLoader(
+    train_ds, batch_size=cfg["training"]["batch_size"],
+    shuffle=True, collate_fn=collate_fn, num_workers=num_workers,
+    persistent_workers=num_workers > 0,
+  )
+  valid_loader = DataLoader(
+    valid_ds, batch_size=cfg["training"]["batch_size"],
+    shuffle=False, collate_fn=collate_fn, num_workers=num_workers,
+    persistent_workers=num_workers > 0,
+  )
 
   model = GCTGCUP(
+    vocab_size=len(vocab),
     hidden_dim=cfg["model"]["hidden_dim"],
+    num_heads=cfg["model"]["num_heads"],
+    num_encoder_layers=cfg["model"]["num_encoder_layers"],
+    num_decoder_layers=cfg["model"]["num_decoder_layers"],
+    ggnn_steps=cfg["model"]["ggnn_steps"],
     dropout=cfg["model"]["dropout"],
     graphcodebert_name=cfg["model"]["graphcodebert"],
     freeze_bert=cfg["model"]["freeze_graphcodebert"],
     long_threshold=cfg["data"]["long_comment_threshold"],
-    update_model_name=cfg["model"].get("update_model", "google/flan-t5-base"),
-    max_src_len=cfg["model"].get("max_src_len", 512),
-    max_tgt_len=cfg["model"].get("max_tgt_len", 128),
-    max_edit_chars=cfg["model"].get("max_edit_chars", 400),
-    max_ast_chars=cfg["model"].get("max_ast_chars", 200),
+    edit_weight=cfg["model"].get("edit_weight", 8.0),
     det_loss_weight=cfg["model"].get("det_loss_weight", 0.15),
     upd_loss_weight=cfg["model"].get("upd_loss_weight", 0.85),
   )
 
   optimizer = build_optimizer(model, cfg)
-
-  # pos_weight fixes detector collapsing to all-negative
   pos_weight = None
   if "pos_weight" in cfg["training"]:
     pos_weight = torch.tensor(cfg["training"]["pos_weight"], dtype=torch.float)
@@ -103,11 +100,11 @@ def main():
     model, train_loader, valid_loader, optimizer, device,
     checkpoint_dir=cfg["training"]["checkpoint_dir"],
     patience=cfg["training"]["patience"],
-    max_valid_batches=cfg["training"].get("max_valid_batches", 10),
+    vocab=vocab,
+    max_valid_batches=cfg["training"].get("max_valid_batches", 12),
     pos_weight=pos_weight,
     grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 4),
     det_threshold=cfg["model"].get("det_threshold", 0.5),
-    max_decode_len=cfg["model"].get("max_decode_len", 128),
   )
 
   epochs = args.epochs or cfg["training"]["update_epochs"]
@@ -117,7 +114,7 @@ def main():
   report_path = os.path.join(cfg["training"]["checkpoint_dir"], "training_history.json")
   with open(report_path, "w") as f:
     json.dump(result, f, indent=2)
-  print(f"\nTraining complete. Best val loss: {result['best_val_loss']:.4f}")
+  print(f"\nTraining complete. Best score: {result.get('best_val_score', 0):.2f}")
   print(f"History saved to {report_path}")
 
 

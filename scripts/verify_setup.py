@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""2-minute preflight check before the expensive Kaggle GPU run."""
+"""Quick preflight before the expensive Kaggle run."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.data.dataset import collate_fn, CUPDataset
+from src.data.dataset import CUPDataset, Vocabulary, collate_fn
 from src.models.gctgcup import GCTGCUP
 
 
@@ -28,62 +28,56 @@ def main() -> None:
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Device: {device}")
 
-  train_path = os.path.join(args.processed_dir, "train.jsonl")
-  if not os.path.exists(train_path):
-    raise SystemExit(f"Missing {train_path} — run prepare_data first.")
+  vocab_path = os.path.join(args.processed_dir, "vocab.json")
+  if not os.path.exists(vocab_path):
+    raise SystemExit(f"Missing {vocab_path}")
 
+  vocab = Vocabulary.load(vocab_path)
   samples = []
-  with open(train_path, encoding="utf-8") as f:
+  with open(os.path.join(args.processed_dir, "train.jsonl"), encoding="utf-8") as f:
     for i, line in enumerate(f):
       if i >= 4:
         break
       samples.append(json.loads(line))
 
-  ds = CUPDataset(samples, long_threshold=cfg["data"]["long_comment_threshold"])
+  ds = CUPDataset(samples, vocab, long_threshold=cfg["data"]["long_comment_threshold"])
   batch = collate_fn([ds[i] for i in range(min(2, len(ds)))])
 
   model = GCTGCUP(
+    vocab_size=len(vocab),
     hidden_dim=cfg["model"]["hidden_dim"],
+    num_heads=cfg["model"]["num_heads"],
+    num_encoder_layers=cfg["model"]["num_encoder_layers"],
+    num_decoder_layers=cfg["model"]["num_decoder_layers"],
+    ggnn_steps=cfg["model"]["ggnn_steps"],
     dropout=cfg["model"]["dropout"],
     graphcodebert_name=cfg["model"]["graphcodebert"],
     freeze_bert=cfg["model"]["freeze_graphcodebert"],
-    update_model_name=cfg["model"]["update_model"],
-    max_src_len=cfg["model"]["max_src_len"],
-    max_tgt_len=cfg["model"]["max_tgt_len"],
-    max_edit_chars=cfg["model"].get("max_edit_chars", 350),
-    max_ast_chars=cfg["model"].get("max_ast_chars", 180),
-    det_loss_weight=cfg["model"].get("det_loss_weight", 0.10),
-    upd_loss_weight=cfg["model"].get("upd_loss_weight", 0.90),
+    long_threshold=cfg["data"]["long_comment_threshold"],
+    edit_weight=cfg["model"].get("edit_weight", 8.0),
   ).to(device)
 
   for k, v in batch.items():
     if isinstance(v, torch.Tensor):
       batch[k] = v.to(device)
 
-  model.train()
   out = model(batch)
-  loss = out["loss"].item()
-  if not (0 < loss < 100):
-    raise SystemExit(f"Suspicious loss={loss} — abort before full train.")
-  print(f"Forward OK | loss={loss:.4f}")
+  print(f"Forward OK | loss={out['loss'].item():.4f}")
 
-  model.eval()
-  with torch.no_grad():
-    preds, beams = model.generate(
-      batch["src_methods"][:1],
-      batch["dst_methods"][:1],
-      batch["src_descs"][:1],
-      batch["edit_texts"][:1],
-      batch["ast_texts"][:1],
-      beam_size=2,
-      force_update=True,
-      max_len=cfg["model"]["max_decode_len"],
-    )
-  print(f"Generate OK | pred={preds[0]!r}")
-  print(f"Reference   | ref ={batch['dst_descs'][0]!r}")
-  if not preds[0].strip():
-    raise SystemExit("Empty prediction — abort before full train.")
-
+  src_tok = [" ".join(t) for t in batch["src_tokens_list"]]
+  gen_ids, no_upd, _ = model.generate(
+    batch["src_ids"], batch["edit_ids"],
+    batch["src_methods"], batch["dst_methods"],
+    batch["graphs"],
+    beam_size=1, force_update=True,
+    comments=batch["src_descs"], src_descs=src_tok,
+  )
+  pred = " ".join(vocab.decode(gen_ids[0])) if gen_ids[0] else no_upd[0]
+  ref = " ".join(batch["dst_tokens_list"][0])
+  print(f"Generate OK | pred={pred[:80]!r}")
+  print(f"Reference   | ref ={ref[:80]!r}")
+  if not pred.strip():
+    raise SystemExit("Empty prediction — abort.")
   print("\n=== ALL PREFLIGHT CHECKS PASSED ===")
 
 

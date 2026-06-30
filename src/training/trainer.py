@@ -12,7 +12,6 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.dataset import collate_fn
 from src.evaluation.metrics import compute_all_metrics
 
 
@@ -26,12 +25,11 @@ class Trainer:
     device: torch.device,
     checkpoint_dir: str = "checkpoints",
     patience: int = 5,
-    tokenizer=None,
+    vocab=None,
     max_valid_batches: int = 10,
     pos_weight: Optional[torch.Tensor] = None,
     grad_accumulation_steps: int = 4,
     det_threshold: float = 0.5,
-    max_decode_len: int = 128,
   ):
     self.model = model.to(device)
     self.train_loader = train_loader
@@ -40,16 +38,14 @@ class Trainer:
     self.device = device
     self.checkpoint_dir = checkpoint_dir
     self.patience = patience
-    self.tokenizer = tokenizer
+    self.vocab = vocab
     self.max_valid_batches = max_valid_batches
     self.det_threshold = det_threshold
-    self.max_decode_len = max_decode_len
-    # move pos_weight to device
     self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
     self.grad_accumulation_steps = grad_accumulation_steps
     os.makedirs(checkpoint_dir, exist_ok=True)
     self.best_val_loss = float("inf")
-    self.best_val_score = float("-inf")   # update-quality score (higher = better)
+    self.best_val_score = float("-inf")
     self.epochs_no_improve = 0
     self.scheduler = None
     self.use_amp = device.type == "cuda"
@@ -79,7 +75,6 @@ class Trainer:
       n += 1
       if (step + 1) % self.grad_accumulation_steps == 0:
         self._optimizer_step()
-    # final leftover
     if n % self.grad_accumulation_steps != 0:
       self._optimizer_step()
     return total_loss / max(n, 1)
@@ -109,28 +104,34 @@ class Trainer:
       det_preds.extend(preds)
       det_labels.extend(labels)
 
-      # Source = old comment, reference = new comment (raw text).
-      src_texts = batch["src_descs"]
-      ref_texts = batch["dst_descs"]
+      src_tok_texts = [" ".join(t) for t in batch["src_tokens_list"]]
+      ref_tok_texts = [" ".join(t) for t in batch["dst_tokens_list"]]
 
-      # Greedy decode (beam=1) during training validation for speed;
-      # full beam search is used only in the final scripts/evaluate.py run.
-      # force_update=True -> measure pure update quality on every sample;
-      # update metrics are restricted to the outdated subset below.
-      pred_texts, beam_b = self.model.generate(
+      gen_ids, no_upd_texts, beam_cands = self.model.generate(
+        batch["src_ids"], batch["edit_ids"],
         batch["src_methods"], batch["dst_methods"],
-        batch["src_descs"], batch["edit_texts"], batch["ast_texts"],
+        batch["graphs"],
         beam_size=1,
         det_threshold=self.det_threshold,
+        comments=batch["src_descs"],
+        src_descs=src_tok_texts,
+        return_beam_candidates=True,
         force_update=True,
-        max_len=self.max_decode_len,
       )
 
-      for pred_text, cands, ref, src in zip(pred_texts, beam_b, ref_texts, src_texts):
+      for ids, no_upd, cands, ref, src in zip(
+        gen_ids, no_upd_texts, beam_cands, ref_tok_texts, src_tok_texts
+      ):
+        if no_upd is not None:
+          pred_text = no_upd
+          beam_texts = [no_upd] * 5
+        else:
+          pred_text = " ".join(self.vocab.decode(ids))
+          beam_texts = [" ".join(self.vocab.decode(c)) for c in cands]
         predictions.append(pred_text)
         references.append(ref)
         sources.append(src)
-        beam_candidates_all.append(cands)
+        beam_candidates_all.append(beam_texts)
 
       is_nciu_list.extend(batch["is_nciu"].cpu().tolist())
       is_long_list.extend(batch["is_long"].cpu().tolist())
@@ -140,7 +141,7 @@ class Trainer:
       beam_candidates=beam_candidates_all,
       det_preds=det_preds, det_labels=det_labels,
       is_nciu=is_nciu_list, is_long=is_long_list,
-      outdated=det_labels,   # update metrics on the outdated-only subset
+      outdated=det_labels,
     )
     metrics.per_sample = {"val_loss": total_loss / max(n, 1)}
     return metrics
@@ -155,7 +156,6 @@ class Trainer:
     return out
 
   def fit(self, epochs: int) -> Dict:
-    # resume from best checkpoint if it exists
     best_path = os.path.join(self.checkpoint_dir, "best.pt")
     if os.path.exists(best_path):
       print("Resuming from best.pt ...")
@@ -177,8 +177,8 @@ class Trainer:
       val_loss = metrics.per_sample["val_loss"]
       elapsed = time.time() - t0
 
-      # Checkpoint on multi-metric update quality (TG-CUP headline = accuracy + BLEU/SARI).
-      val_score = metrics.accuracy + 0.25 * metrics.sari + 0.15 * metrics.bleu
+      # Prioritize exact-match accuracy (TG-CUP headline metric) + BLEU/SARI.
+      val_score = metrics.accuracy * 2.0 + metrics.bleu * 0.2 + metrics.sari * 0.2
 
       print(
         f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
@@ -192,15 +192,18 @@ class Trainer:
         self.best_val_loss = val_loss
         self.epochs_no_improve = 0
         self.save_checkpoint("best.pt")
-        print(f"  ✓ new best (score={val_score:.2f}) -> saved best.pt")
+        print(f"  new best (score={val_score:.2f}) -> saved best.pt")
       else:
         self.epochs_no_improve += 1
         if self.epochs_no_improve >= self.patience:
           print(f"Early stopping at epoch {epoch}")
           break
 
-    return {"history": history, "best_val_loss": self.best_val_loss,
-            "best_val_score": self.best_val_score}
+    return {
+      "history": history,
+      "best_val_loss": self.best_val_loss,
+      "best_val_score": self.best_val_score,
+    }
 
   def save_checkpoint(self, name: str) -> None:
     path = os.path.join(self.checkpoint_dir, name)
