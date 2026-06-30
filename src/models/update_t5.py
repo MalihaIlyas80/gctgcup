@@ -21,7 +21,7 @@ from typing import List, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-TOKENIZER_LOADER_VERSION = "vocab_merges_direct_v4"
+TOKENIZER_LOADER_VERSION = "vocab_merges_direct_v5"
 
 
 def _resolve_hub_file(model_name: str, filename: str) -> str:
@@ -145,8 +145,10 @@ def _load_codet5_tokenizer(model_name: str) -> _CodeT5TokenizerWrapper:
   # Load BPE directly from hub files (preserves merge rank order).
   bpe = BPE(vocab=vocab_path, merges=merges_path)
   tok = Tokenizer(bpe)
-  tok.pre_tokenizer = Metaspace(replacement="▁", prepend_scheme="always")
-  tok.decoder = MetaspaceDecoder(replacement="▁", prepend_scheme="always")
+  # CodeT5 / RoBERTa BPE uses GPT-2-style "Ġ" as the word-boundary marker, NOT "▁".
+  # Using "▁" (SentencePiece) was the root cause of BLEU ~1% despite falling loss.
+  tok.pre_tokenizer = Metaspace(replacement="Ġ", prepend_scheme="always")
+  tok.decoder = MetaspaceDecoder(replacement="Ġ", prepend_scheme="always")
   # MUST match HuggingFace RobertaTokenizer: add_prefix_space=True.
   tok.post_processor = RobertaProcessing(
     ("</s>", eos_id),
@@ -156,14 +158,14 @@ def _load_codet5_tokenizer(model_name: str) -> _CodeT5TokenizerWrapper:
   )
 
   wrapper = _CodeT5TokenizerWrapper(tok, pad_id, eos_id, special_ids)
-  # Sanity check: round-trip must preserve text.
-  test = "Returns the maximum value."
-  rt = wrapper.batch_decode(
-    wrapper(test, max_length=32, add_special_tokens=True).input_ids,
-    skip_special_tokens=True,
-  )[0]
-  if rt != test:
-    print(f"WARNING: tokenizer round-trip mismatch: {test!r} -> {rt!r}")
+  # Sanity check: round-trip must preserve text (catches wrong pretokenizer).
+  for test in ("Returns the maximum value.", "update comment test"):
+    rt = wrapper.batch_decode(
+      wrapper(test, max_length=32, add_special_tokens=True).input_ids,
+      skip_special_tokens=True,
+    )[0]
+    if rt != test:
+      raise RuntimeError(f"Tokenizer round-trip failed: {test!r} -> {rt!r}")
 
   print(f"CodeT5 tokenizer loaded ({TOKENIZER_LOADER_VERSION}) from vocab+merges")
   return wrapper
@@ -250,7 +252,7 @@ class UpdateT5(nn.Module):
     cfg = self.t5.config
     with torch.autocast(device_type=device.type, enabled=False):
       input_ids, attn = self._encode(texts, device)
-      gen = self.t5.generate(
+      gen_kwargs = dict(
         input_ids=input_ids,
         attention_mask=attn,
         num_beams=num_beams,
@@ -259,9 +261,11 @@ class UpdateT5(nn.Module):
         decoder_start_token_id=cfg.decoder_start_token_id,
         eos_token_id=cfg.eos_token_id,
         pad_token_id=cfg.pad_token_id,
-        length_penalty=1.1,
-        early_stopping=True,
       )
+      if num_beams > 1:
+        gen_kwargs["length_penalty"] = 1.1
+        gen_kwargs["early_stopping"] = True
+      gen = self.t5.generate(**gen_kwargs)
     decoded = self.tokenizer.batch_decode(gen, skip_special_tokens=True)
     decoded = [t.strip() for t in decoded]
 
