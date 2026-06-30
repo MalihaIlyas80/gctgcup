@@ -19,7 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.data.ast_diff import ASTDiffGraph
-from src.data.cleaning import apply_comment_code_renames, comment_has_code_rename
+from src.data.cleaning import (
+  apply_comment_edits_from_code_change,
+  comment_has_code_edit,
+  fuse_rule_and_model,
+)
 
 from .detection import OutdatedCommentDetector
 from .ggnn import GGNN
@@ -408,6 +412,32 @@ class GCTGCUP(nn.Module):
     return out
 
   @classmethod
+  def build_hybrid_prediction(
+    cls,
+    src_tokens: List[str],
+    code_change_seq: list,
+    model_pred: str,
+  ) -> tuple:
+    """Rule edits + neural beam fused for maximum exact-match on small data."""
+    model_toks = model_pred.split() if model_pred else []
+    rule_toks = apply_comment_edits_from_code_change(src_tokens, code_change_seq)
+    fused_toks = fuse_rule_and_model(rule_toks, model_toks)
+    rule_str = cls._format_surface(rule_toks)
+    fused_str = cls._format_surface(fused_toks)
+    merge_model = cls.merge_src_prediction(src_tokens, model_toks) if model_toks else ""
+    merge_fused = cls.merge_src_prediction(src_tokens, fused_toks) if fused_toks else ""
+
+    if code_change_seq and comment_has_code_edit(src_tokens, code_change_seq):
+      primary = fused_str or merge_fused or rule_str or merge_model or model_pred
+    else:
+      primary = merge_model or model_pred or merge_fused or fused_str
+
+    extras = cls._dedupe_candidates([
+      primary, fused_str, merge_fused, rule_str, merge_model, model_pred,
+    ])
+    return primary, extras
+
+  @classmethod
   def _pick_primary_prediction(
     cls,
     src_tokens: List[str],
@@ -416,12 +446,8 @@ class GCTGCUP(nn.Module):
     merge_pred: str,
     code_change_seq: list,
   ) -> str:
-    """Prefer rule-based rename when code edits touch the comment."""
-    if rule_pred and comment_has_code_rename(src_tokens, code_change_seq):
-      return rule_pred
-    if merge_pred:
-      return merge_pred
-    return model_pred
+    primary, _ = cls.build_hybrid_prediction(src_tokens, code_change_seq, model_pred)
+    return primary
 
   _SKIP_OUTPUT = frozenset({
     "<sep>", "<s>", "</s>", "<pad>", "<unk>",
@@ -581,22 +607,15 @@ class GCTGCUP(nn.Module):
       cand_surfs = [self._format_surface(surf) for _, surf, _ in finished]
 
       model_pred = cand_surfs[0] if cand_surfs else ""
-      pred_toks = model_pred.split() if model_pred else []
-      rule_pred = self._format_surface(
-        apply_comment_code_renames(src_tokens_list[i], code_change_seqs[i]),
+      primary, all_cands = self.build_hybrid_prediction(
+        src_tokens_list[i], code_change_seqs[i], model_pred,
       )
-      merge_pred = (
-        self.merge_src_prediction(src_tokens_list[i], pred_toks) if pred_toks else ""
-      )
-      all_cands = self._dedupe_candidates([rule_pred, merge_pred] + cand_surfs)
-      primary = self._pick_primary_prediction(
-        src_tokens_list[i], model_pred, rule_pred, merge_pred, code_change_seqs[i],
-      )
+      all_cands = self._dedupe_candidates(all_cands + cand_surfs)[: max(beam_size * 2, 8)]
 
       token_ids.append(cand_ids[0] if cand_ids else [])
       surface_texts.append(primary)
       beam_results.append(cand_ids if cand_ids else [[]])
-      beam_surface_results.append(all_cands[: max(beam_size, 1)] or [""])
+      beam_surface_results.append(all_cands or [""])
 
     if return_beam_candidates:
       return token_ids, no_update_texts, beam_results, surface_texts, beam_surface_results

@@ -86,7 +86,13 @@ class Trainer:
   def _val_score(self, metrics, phase: str) -> float:
     if phase == "detection":
       return metrics.det_f1
-    return metrics.accuracy * 2.0 + metrics.bleu * 0.2 + metrics.sari * 0.2
+    # Optimise checkpoint for TG-CUP headline metrics (accuracy + recall@5).
+    return (
+      metrics.accuracy * 4.0
+      + metrics.recall_at_5 * 0.5
+      + metrics.sari * 0.25
+      + metrics.bleu * 0.15
+    )
 
   @torch.no_grad()
   def validate(self) -> Dict:

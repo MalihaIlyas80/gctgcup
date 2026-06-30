@@ -4,6 +4,7 @@ Follows TG-CUP paper Section 2.2: remove URLs, emails, irrelevant noise.
 """
 from __future__ import annotations
 
+import difflib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -150,21 +151,84 @@ def apply_comment_code_renames(
     src_tokens: list[str],
     code_change_seq: list,
 ) -> list[str]:
+    """Backward-compatible alias for rename-only edits."""
+    return apply_comment_edits_from_code_change(src_tokens, code_change_seq)
+
+
+def apply_comment_edits_from_code_change(
+    src_tokens: list[str],
+    code_change_seq: list,
+) -> list[str]:
     """
-    Apply code identifier renames to comment tokens (TG-CUP-style local edits).
-    When code does replace(old, new), update matching tokens in the old comment.
+    Apply code AST-diff edits to the old comment (TG-CUP local-edit prior).
+    replace / delete / insert from code_change_seq are mirrored in comment tokens.
     """
     out = list(src_tokens)
     for triple in code_change_seq or []:
-        if len(triple) != 3 or triple[2] != "replace":
+        if len(triple) != 3:
             continue
-        old_t, new_t = triple[0], triple[1]
-        if not old_t or not new_t or old_t in ("<con>", "<pad>"):
+        old_t, new_t, act = triple[0], triple[1], triple[2]
+        if old_t in ("<con>", "<pad>") or (not old_t and not new_t):
             continue
-        for i, tok in enumerate(out):
-            if tok == old_t or tok.lower() == old_t.lower():
-                out[i] = new_t
+
+        if act == "replace" and old_t and new_t:
+            for i, tok in enumerate(out):
+                if tok == old_t or tok.lower() == old_t.lower():
+                    out[i] = new_t
+        elif act == "delete" and old_t and len(old_t) > 2:
+            out = [t for t in out if t.lower() != old_t.lower()]
+        elif act == "insert" and new_t and len(new_t) > 2:
+            if new_t.lower() in [x.lower() for x in out]:
+                continue
+            placed = False
+            if old_t and len(old_t) > 2:
+                for i, tok in enumerate(out):
+                    if tok.lower() == old_t.lower():
+                        out.insert(i + 1, new_t)
+                        placed = True
+                        break
+            if not placed:
+                out.append(new_t)
     return out
+
+
+def fuse_rule_and_model(
+    rule_tokens: list[str],
+    model_tokens: list[str],
+) -> list[str]:
+    """Keep rule-stable spans; use model tokens for insert/replace regions."""
+    if not model_tokens:
+        return list(rule_tokens)
+    if not rule_tokens:
+        return list(model_tokens)
+    sm = difflib.SequenceMatcher(None, rule_tokens, model_tokens, autojunk=False)
+    fused: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            fused.extend(rule_tokens[i1:i2])
+        elif tag in ("replace", "insert"):
+            fused.extend(model_tokens[j1:j2])
+        elif tag == "delete":
+            pass
+    return fused
+
+
+def comment_has_code_edit(src_tokens: list[str], code_change_seq: list) -> bool:
+    """True when any code edit plausibly affects the old comment."""
+    src_lower = {t.lower() for t in src_tokens}
+    src_text = " ".join(src_tokens).lower()
+    for triple in code_change_seq or []:
+        if len(triple) != 3:
+            continue
+        old_t, new_t, act = triple[0], triple[1], triple[2]
+        if act == "replace" and old_t and old_t.lower() in src_lower:
+            return True
+        if act == "delete" and old_t and len(old_t) > 2 and old_t.lower() in src_lower:
+            return True
+        if act == "insert" and new_t and len(new_t) > 2 and new_t.lower() not in src_lower:
+            if not old_t or old_t.lower() in src_text:
+                return True
+    return False
 
 
 def comment_has_code_rename(src_tokens: list[str], code_change_seq: list) -> bool:

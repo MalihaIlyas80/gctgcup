@@ -83,12 +83,13 @@ def main() -> None:
     ]
     run(train_cmd)
 
+  eval_beam = args.eval_beam_size or cfg["model"].get("beam_size", 5)
   run([
     sys.executable, "scripts/evaluate.py",
     "--config", args.config,
     "--processed-dir", args.processed_dir,
     "--checkpoint", os.path.join(cfg["training"]["checkpoint_dir"], "best.pt"),
-    "--beam-size", str(args.eval_beam_size),
+    "--beam-size", str(eval_beam),
   ])
 
 

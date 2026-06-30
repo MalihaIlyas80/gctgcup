@@ -1,4 +1,5 @@
-# GC-TGCUP — joint train + edit-aware decode (accuracy-focused, faster eval).
+# GC-TGCUP — ONE-SHOT Kaggle run (20k, beat TG-CUP on outdated-only eval).
+# GGNN + GraphCodeBERT + hybrid edit decode (rule + neural fusion).
 project_name: "GC-TGCUP"
 
 data:
@@ -10,32 +11,32 @@ data:
   long_comment_threshold: 25
   min_comment_len: 3
   seed: 42
-  vocab_max_size: 15000
+  vocab_max_size: 18000        # dst tokens first — better exact-match coverage
 
 model:
   hidden_dim: 256
   num_heads: 8
   num_encoder_layers: 4
   num_decoder_layers: 4
-  ggnn_steps: 6
+  ggnn_steps: 6                  # TG-CUP AST-diff GGNN (mandatory)
   dropout: 0.2
   graphcodebert: "microsoft/graphcodebert-base"
-  freeze_graphcodebert: false
-  edit_weight: 5.0              # sequence-diff loss on changed comment tokens
-  det_loss_weight: 0.15
-  upd_loss_weight: 0.85
-  beam_size: 5
-  max_decode_len: 50
+  freeze_graphcodebert: false    # fine-tune (mandatory thesis)
+  edit_weight: 4.0               # sequence-diff on changed comment tokens
+  det_loss_weight: 0.12
+  upd_loss_weight: 0.88
+  beam_size: 10                  # wide beam + hybrid candidates for recall@5
+  max_decode_len: 64
   det_threshold: 0.5
 
 training:
-  two_stage: false              # joint: detection + update together (proven BLEU path)
-  detection_epochs: 6           # only if two_stage: true
-  update_epochs: 14               # joint epochs (~1.2h on Kaggle T4)
+  two_stage: false               # joint det+update (best BLEU path on 20k)
+  detection_epochs: 6
+  update_epochs: 16              # ~80-90 min on T4; early-stop patience 5
   batch_size: 8
-  max_valid_batches: 8          # faster validation (~640 samples)
-  valid_beam_size: 5            # match final eval beam
-  pos_oversample: 2.5           # oversample outdated comments in training
+  max_valid_batches: 10          # ~800 val samples, beam=8
+  valid_beam_size: 8
+  pos_oversample: 4.0            # 4x outdated samples — small-data TG-CUP beat
   learning_rate: 3.0e-4
   graphcodebert_lr: 2.0e-5
   weight_decay: 0.01
