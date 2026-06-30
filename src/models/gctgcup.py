@@ -291,6 +291,14 @@ class GCTGCUP(nn.Module):
     nll = nll * weights
     return nll.sum() / weights.sum().clamp(min=1.0)
 
+  def _zero_trainable_loss(self) -> torch.Tensor:
+    """Differentiable zero — safe backward when a batch has no update targets."""
+    loss = torch.tensor(0.0, device=next(self.parameters()).device)
+    for p in self.parameters():
+      if p.requires_grad:
+        loss = loss + p.sum() * 0.0
+    return loss
+
   def forward(
     self,
     batch: Dict,
@@ -330,6 +338,8 @@ class GCTGCUP(nn.Module):
         upd_logprobs, targets, batch["src_ids"][idx],
         edit_weight=self.edit_weight,
       )
+    elif phase == "update":
+      upd_loss = self._zero_trainable_loss()
     result["upd_loss"] = upd_loss
 
     if phase == "detection":
@@ -344,7 +354,6 @@ class GCTGCUP(nn.Module):
 
   def set_training_phase(self, phase: str) -> None:
     """Freeze/unfreeze submodules for sequential two-stage training."""
-    det_modules = [self.detector]
     upd_modules = [
       self.token_embed, self.pos_enc, self.ggnn, self.seq_encoder,
       self.decoder, self.output_proj, self.copy_key, self.p_gen, self.fuse_code_sem,
@@ -353,20 +362,24 @@ class GCTGCUP(nn.Module):
       for m in upd_modules:
         for p in m.parameters():
           p.requires_grad = False
-      for m in det_modules:
-        for p in m.parameters():
-          p.requires_grad = True
+      for p in self.detector.parameters():
+        p.requires_grad = True
     elif phase == "update":
-      for m in det_modules:
-        for p in m.parameters():
-          p.requires_grad = False
+      # Keep detection head frozen; fine-tune GraphCodeBERT + update decoder.
+      for p in self.detector.classifier.parameters():
+        p.requires_grad = False
+      for p in self.detector.comment_proj.parameters():
+        p.requires_grad = False
+      for p in self.detector.cross_attn.parameters():
+        p.requires_grad = False
+      for p in self.code_semantic.parameters():
+        p.requires_grad = True
       for m in upd_modules:
         for p in m.parameters():
           p.requires_grad = True
     else:
-      for m in det_modules + upd_modules:
-        for p in m.parameters():
-          p.requires_grad = True
+      for p in self.parameters():
+        p.requires_grad = True
 
   _SKIP_OUTPUT = frozenset({
     "<sep>", "<s>", "</s>", "<pad>", "<unk>",

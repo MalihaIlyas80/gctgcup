@@ -70,6 +70,8 @@ class Trainer:
       with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
         out = self.model(batch, pos_weight=self.pos_weight, phase=phase)
         loss = out["loss"] / self.grad_accumulation_steps
+      if not loss.requires_grad:
+        continue
       self.scaler.scale(loss).backward()
       total_loss += out["loss"].item()
       n += 1

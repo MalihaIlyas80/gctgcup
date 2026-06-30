@@ -36,6 +36,12 @@ def main() -> None:
   parser.add_argument("--skip-verify", action="store_true")
   parser.add_argument("--skip-train", action="store_true")
   parser.add_argument("--eval-beam-size", type=int, default=5)
+  parser.add_argument(
+    "--start-phase",
+    choices=("both", "detection", "update"),
+    default="both",
+    help="Pass update to skip stage-1 if checkpoints/best.pt exists",
+  )
   args = parser.parse_args()
 
   os.chdir(_root())
@@ -69,11 +75,13 @@ def main() -> None:
     ])
 
   if not args.skip_train:
-    run([
+    train_cmd = [
       sys.executable, "scripts/train.py",
       "--config", args.config,
       "--processed-dir", args.processed_dir,
-    ])
+      "--start-phase", args.start_phase,
+    ]
+    run(train_cmd)
 
   run([
     sys.executable, "scripts/evaluate.py",

@@ -44,6 +44,12 @@ def main():
   parser.add_argument("--config", default="configs/kaggle_gpu.yaml")
   parser.add_argument("--processed-dir", default="data/processed")
   parser.add_argument("--epochs", type=int, default=None)
+  parser.add_argument(
+    "--start-phase",
+    choices=("both", "detection", "update"),
+    default="both",
+    help="both=full two-stage; update=resume stage-2 only (needs checkpoints/best.pt)",
+  )
   args = parser.parse_args()
 
   with open(args.config, encoding="utf-8") as f:
@@ -111,7 +117,15 @@ def main():
   det_epochs = cfg["training"].get("detection_epochs", 5)
   two_stage = cfg["training"].get("two_stage", True)
 
-  if two_stage:
+  if two_stage and args.start_phase == "update":
+    ckpt = os.path.join(cfg["training"]["checkpoint_dir"], "best.pt")
+    if not os.path.exists(ckpt):
+      raise SystemExit(f"Missing {ckpt} ? run stage 1 first or use --start-phase both")
+    print(f"\nResuming stage 2 only from {ckpt} ({epochs} update epochs)")
+    trainer.load_checkpoint("best.pt")
+    trainer._reset_early_stop()
+    result = trainer.fit(epochs, phase="update", resume=False)
+  elif two_stage:
     print(f"\nTwo-stage training: detection ({det_epochs} ep) -> update ({epochs} ep)")
     result = trainer.fit_two_stage(det_epochs, epochs)
   else:
