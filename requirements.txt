@@ -1,5 +1,6 @@
 torch>=2.0.0
-transformers>=4.36.0
+transformers==4.46.3
+tokenizers>=0.14.0,<0.21.0
 sentencepiece>=0.1.99
 torch-geometric>=2.4.0
 javalang>=0.13.0
