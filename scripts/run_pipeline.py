@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-One-shot Kaggle pipeline: prepare data -> train -> evaluate vs TG-CUP.
+One-shot Kaggle pipeline: prepare -> verify -> train -> evaluate vs TG-CUP.
 
-Usage (Kaggle GPU notebook):
-  !python scripts/run_pipeline.py --config configs/kaggle_gpu.yaml
-
-Re-prepare only (drop old processed jsonl with <con> tokens):
-  !python scripts/run_pipeline.py --fresh
+  !python scripts/run_pipeline.py --config configs/kaggle_gpu.yaml --fresh
 """
 from __future__ import annotations
 
@@ -29,15 +25,15 @@ def run(cmd: list[str]) -> None:
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description="Prepare + train + evaluate GC-TGCUP")
+  parser = argparse.ArgumentParser(description="Prepare + verify + train + evaluate")
   parser.add_argument("--config", default="configs/kaggle_gpu.yaml")
   parser.add_argument("--raw-dir", default="cup2_dataset")
   parser.add_argument("--processed-dir", default="data/processed")
-  parser.add_argument("--max-samples", type=int, default=None,
-                      help="Override config data.max_samples")
+  parser.add_argument("--max-samples", type=int, default=None)
   parser.add_argument("--fresh", action="store_true",
-                      help="Delete processed data + checkpoints before running")
+                      help="Delete processed data + checkpoints first")
   parser.add_argument("--skip-prepare", action="store_true")
+  parser.add_argument("--skip-verify", action="store_true")
   parser.add_argument("--skip-train", action="store_true")
   parser.add_argument("--eval-beam-size", type=int, default=5)
   args = parser.parse_args()
@@ -61,6 +57,13 @@ def main() -> None:
       "--raw-dir", args.raw_dir,
       "--output-dir", args.processed_dir,
       "--max-samples", str(max_samples),
+    ])
+
+  if not args.skip_verify:
+    run([
+      sys.executable, "scripts/verify_setup.py",
+      "--config", args.config,
+      "--processed-dir", args.processed_dir,
     ])
 
   if not args.skip_train:

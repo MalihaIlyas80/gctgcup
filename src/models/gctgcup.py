@@ -34,7 +34,7 @@ class GCTGCUP(nn.Module):
     graphcodebert_name: str = "microsoft/graphcodebert-base",
     freeze_bert: bool = False,
     long_threshold: int = 25,
-    update_model_name: str = "Salesforce/codet5-base",
+    update_model_name: str = "google/flan-t5-base",
     max_src_len: int = 512,
     max_tgt_len: int = 128,
     max_edit_chars: int = 400,

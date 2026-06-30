@@ -1,4 +1,4 @@
-# GC-TGCUP — Kaggle GPU config (target: BEAT TG-CUP on 20k data).
+# GC-TGCUP — Kaggle FREE GPU: one-shot run to beat TG-CUP on 20k data.
 project_name: "GC-TGCUP"
 
 data:
@@ -8,9 +8,6 @@ data:
   train_ratio: 0.8
   valid_ratio: 0.1
   test_ratio: 0.1
-  max_code_len: 256
-  max_comment_len: 128
-  max_edit_len: 512
   long_comment_threshold: 25
   min_comment_len: 3
   seed: 42
@@ -19,29 +16,29 @@ model:
   hidden_dim: 256
   dropout: 0.2
   graphcodebert: "microsoft/graphcodebert-base"
-  freeze_graphcodebert: true       # free GPU for larger CodeT5-base updater
-  # Larger pretrained updater — main lever to beat TG-CUP exact-match / BLEU.
-  update_model: "Salesforce/codet5-base"
+  freeze_graphcodebert: true          # save VRAM for Flan-T5-base updater
+  # Flan-T5: reliable HF tokenizer + strong copy-edit on small data.
+  update_model: "google/flan-t5-base"
   max_src_len: 512
   max_tgt_len: 128
-  max_edit_chars: 400
-  max_ast_chars: 200
-  det_loss_weight: 0.15            # focus training on UPDATE quality
-  upd_loss_weight: 0.85
+  max_edit_chars: 350
+  max_ast_chars: 180
+  det_loss_weight: 0.10               # 90% gradient on UPDATE task
+  upd_loss_weight: 0.90
   beam_size: 5
   max_decode_len: 128
   det_threshold: 0.5
 
 training:
-  batch_size: 4                    # codet5-base + GraphCodeBERT on T4
-  update_epochs: 20
-  max_valid_batches: 15
+  batch_size: 2                       # T4 16GB: GraphCodeBERT + flan-t5-base
+  update_epochs: 15
+  max_valid_batches: 8                # fast validation each epoch
   learning_rate: 3.0e-4
   graphcodebert_lr: 1.0e-5
-  update_lr: 2.0e-5
+  update_lr: 1.5e-4                   # Flan-T5 fine-tune LR
   weight_decay: 0.01
-  patience: 8
-  grad_accumulation_steps: 8       # effective batch = 32
+  patience: 5
+  grad_accumulation_steps: 16         # effective batch = 32
   device: "auto"
   checkpoint_dir: "checkpoints"
   pos_weight: 2.5

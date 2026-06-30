@@ -152,7 +152,7 @@ def main():
     graphcodebert_name=cfg["model"]["graphcodebert"],
     freeze_bert=cfg["model"].get("freeze_graphcodebert", True),
     long_threshold=cfg["data"]["long_comment_threshold"],
-    update_model_name=cfg["model"].get("update_model", "Salesforce/codet5-base"),
+    update_model_name=cfg["model"].get("update_model", "google/flan-t5-base"),
     max_src_len=cfg["model"].get("max_src_len", 512),
     max_tgt_len=cfg["model"].get("max_tgt_len", 128),
     max_edit_chars=cfg["model"].get("max_edit_chars", 400),
