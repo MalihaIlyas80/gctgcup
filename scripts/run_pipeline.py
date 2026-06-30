@@ -35,7 +35,11 @@ def main() -> None:
   parser.add_argument("--skip-prepare", action="store_true")
   parser.add_argument("--skip-verify", action="store_true")
   parser.add_argument("--skip-train", action="store_true")
-  parser.add_argument("--eval-beam-size", type=int, default=5)
+  parser.add_argument("--eval-beam-size", type=int, default=None)
+  parser.add_argument(
+    "--eval-max-batches", type=int, default=None,
+    help="Cap eval batches (63≈500 samples ~15min; null=full test)",
+  )
   parser.add_argument(
     "--start-phase",
     choices=("both", "detection", "update"),
@@ -83,14 +87,21 @@ def main() -> None:
     ]
     run(train_cmd)
 
-  eval_beam = args.eval_beam_size or cfg["model"].get("beam_size", 5)
-  run([
+  eval_beam = args.eval_beam_size or cfg["evaluation"].get(
+    "beam_size", cfg["model"].get("beam_size", 5),
+  )
+  eval_cmd = [
     sys.executable, "scripts/evaluate.py",
     "--config", args.config,
     "--processed-dir", args.processed_dir,
     "--checkpoint", os.path.join(cfg["training"]["checkpoint_dir"], "best.pt"),
     "--beam-size", str(eval_beam),
-  ])
+  ]
+  if args.eval_max_batches is not None:
+    eval_cmd.extend(["--max-batches", str(args.eval_max_batches)])
+  elif cfg["evaluation"].get("max_batches"):
+    eval_cmd.extend(["--max-batches", str(cfg["evaluation"]["max_batches"])])
+  run(eval_cmd)
 
 
 if __name__ == "__main__":

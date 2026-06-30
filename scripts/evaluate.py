@@ -174,13 +174,26 @@ def main():
   else:
     print("WARNING: No checkpoint found.")
 
-  beam_size = args.beam_size or cfg["model"].get("beam_size", 5)
+  beam_size = args.beam_size or cfg["evaluation"].get(
+    "beam_size", cfg["model"].get("beam_size", 5),
+  )
+  max_batches = args.max_batches
+  if max_batches is None:
+    max_batches = cfg["evaluation"].get("max_batches")
+
+  n_batches = len(test_loader) if max_batches is None else min(max_batches, len(test_loader))
+  est_min = n_batches * 0.35  # ~20s/batch with beam 5 on T4
+  print(
+    f"Eval: beam={beam_size}, batches={n_batches}/{len(test_loader)}, "
+    f"~{est_min:.0f} min estimated on GPU"
+  )
+
   metrics = evaluate_model(
     model, test_loader, vocab, device,
     det_threshold=cfg["model"].get("det_threshold", 0.5),
     beam_size=beam_size,
     max_len=cfg["model"].get("max_decode_len", 50),
-    max_batches=args.max_batches,
+    max_batches=max_batches,
   )
   print_comparison(metrics, cfg["evaluation"]["tgcup_baseline"])
 
